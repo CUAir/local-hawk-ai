@@ -1,0 +1,4 @@
+(executable
+ (public_name cvat_data_annotation)
+ (name main)
+ (libraries cvat_data_annotation))

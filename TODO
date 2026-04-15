@@ -1,0 +1,5 @@
+a file type like this exists??
+- [ ] send properly formatted requests back to image GS 
+- [ ] re-evaluate whether we need MP in core.py for the workers
+- [ ] get rid of the time import in core.py (currently to slow the worker loop down)
+- [ ] uncomment the code for getting images from image GS, remove the placeholder
