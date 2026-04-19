@@ -20,3 +20,8 @@ class ROI(object):
             self.box[0] + (self.width // 2),
             self.box[1] + (self.height // 2),
         )
+    
+    def __str__(self):
+        return "ROI(top_left={}, bottom_right={}, width={}, height={})".format(
+            self.top_left, self.bottom_right, self.width, self.height
+        )

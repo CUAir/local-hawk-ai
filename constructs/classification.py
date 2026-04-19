@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Tuple
 
-class Item(Enum):
+class LabelType(Enum):
     """
     Enum to store the classification of a target.
     """
@@ -22,7 +22,10 @@ class Classification:
     """
     def __init__(
         self,
-        item: str = Item.UNKNOWN,
+        label: str = LabelType.UNKNOWN,
         number_conf: float = 0.0,
     ):
-        self.number: Tuple[Item, float] = (item, number_conf)
+        self.label: Tuple[LabelType, float] = (label, number_conf)
+    
+    def __str__(self) -> str:
+        return "Classification(label={}, number_conf={})".format(self.label[0], self.label[1])

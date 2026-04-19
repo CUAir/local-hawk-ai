@@ -3,7 +3,7 @@ from models.classifiers import ImageNet
 from models.detectors import MaskRCNN
 from vision.detectors.abstract_detector import AbstractDetector
 from vision.classifiers.abstract_classifier import AbstractClassifier
-from constructs.classification import Classification, Number
+from constructs.classification import Classification, LabelType
 import argparse
 import PIL.Image as Image
 from multiprocessing import Process
@@ -75,24 +75,36 @@ class Mapper:
         print_green("Map saved to map.jpg")
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper):
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_interval_minutes: float = 5.0):
         print("Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
         # self.target_attr = self.work_client.get_target_attributes()
         print("Initializing Mapper")
         self.mapper = mapper
+        self.result_interval_seconds = max(0.0, float(result_interval_minutes) * 60.0)
+        self.last_result_send_time = 0.0
 
     def run_task(self):
         print(">> Running task...")
+        
         print("> Requesting image")
         self.request_image()
+        time.sleep(1)
         print("> Running model on image")
         self.run_model()
-        # print("Sending result to GS")
-        # self.send_result()
+        print("> Sending result to GS")
+        self.send_result()
+        
+        # now = time.monotonic()
+        # if now - self.last_result_send_time >= self.result_interval_seconds:
+            
+        #     self.last_result_send_time = now
+        # else:
+        #     remaining = int(self.result_interval_seconds - (now - self.last_result_send_time))
+        #     print(f"> Skipping send_result, next send in ~{remaining}s")
         print("> Task finished")
-        time.sleep(1) # sleep 1 second
+        time.sleep(1) # sleep 2 seconds, blocking
 
     # Request image from imaging ground server via work_client.py
     def request_image(self):
@@ -111,20 +123,30 @@ class VisionClient:
 
     # Perform autonomous detection and classification
     def run_model(self):
-        response = self.work_client.send_image(self.image, self.assignment["id"])
+        response = self.work_client.send_image(self.image, self.assignment)
         print(f"> GET Response: {response.status_code}")
 
     # Send result of detection and classification to GS
     def send_result(self):
-        print("TO IMPLEMENT: sending it back correctly")
+        m_assignment, m_roi, m_classification = self.work_client.get_mannequin_image()
+        t_assignment, t_roi, t_classification = self.work_client.get_tent_image()
         
-        rois, classifications = self.work_client.get_best_image()
-        self.work_client.get_image
 
-        for i in range(len(self.rois)):
+        if m_assignment is not None and m_roi is not None and m_classification is not None:
+            print("> Sending mannequin image")
             self.work_client.send_adlc_output(
-                self.assignment, rois[i], classifications[i]
+                m_assignment, m_roi, m_classification
             )
+        else:
+            print("> No valid mannequin image to send")
+
+        if t_assignment is not None and t_roi is not None and t_classification is not None:
+            print("> Sending tent image")
+            self.work_client.send_adlc_output(
+                t_assignment, t_roi, t_classification
+            )
+        else:
+            print("> No valid tent image to send")
 
 def start_mapping_server(mapper: Mapper, port=8000):
     print_green(f"Map HTTP server started on port {port}!")
@@ -140,22 +162,22 @@ def start_mapping_server(mapper: Mapper, port=8000):
     except Exception as e:
         print_red(f"Error in map HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper):
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_interval_minutes: float = 5.0):
     print("Starting Worker process...")
-    worker = VisionClient(work_client, mapper)
+    worker = VisionClient(work_client, mapper, result_interval_minutes)
     while True:
         try:
             worker.run_task()
         except Exception as e:
             print_red(f"Error in Worker process: {e}")
 
-def main(gs_ip_address: str, cs_ip_address : str, map_server_port: int = 8000):
+def main(gs_ip_address: str, cs_ip_address : str, map_server_port: int = 8000, result_interval_minutes: float = 5.0):
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
     mapper = Mapper(work_client)
 
     # TODO: implement MP, not doing it right now to see errors clearly 
-    worker_loop(work_client, mapper)
+    worker_loop(work_client, mapper, result_interval_minutes)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
@@ -181,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument('--gsip', type=str, default="34.73.222.251:8000", help="Specify custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
     parser.add_argument('--csip', type=str, default="34.73.222.251:8000", help="Specify custom IP address")
     parser.add_argument('--map-port', type=int, default=8000, help="Port for the map command HTTP server")
+    parser.add_argument('--interval-minutes', type=float, default=0.1, help="Run send_result() every F minutes")
 
     args = parser.parse_args()
 
@@ -191,4 +214,4 @@ if __name__ == "__main__":
         gs_ip_address = args.gsip
         cs_ip_address = args.csip
 
-    main(gs_ip_address, cs_ip_address, args.map_port)
+    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_minutes)

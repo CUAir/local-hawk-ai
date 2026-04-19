@@ -1,7 +1,7 @@
 import torch
 import os
 from torchvision import models, transforms
-from constructs.classification import Number
+from constructs.classification import LabelType, Classification
 from vision.classifiers.abstract_classifier import AbstractClassifier
 from PIL import Image
 
