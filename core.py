@@ -211,8 +211,8 @@ def main(gs_ip_address: str, cs_ip_address : str, map_server_port: int = 8000, r
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
-    parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
-    parser.add_argument('--csip', type=str, default="34.73.222.251:8000", help="Specify custom IP address")
+    parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
+    parser.add_argument('--csip', type=str, default="34.73.222.251:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8000, help="Port for the map command HTTP server")
     parser.add_argument('--interval-minutes', type=float, default=1.0, help="Run send_result() every F minutes")
 
