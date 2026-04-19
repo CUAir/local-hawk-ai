@@ -6,6 +6,23 @@ from utils.helper import print_green, print_red, print_yellow
 class MapCommandHandler(BaseHTTPRequestHandler):
     mapper = None
     
+    def do_GET(self):
+        """Return current mapping pipeline status (mirrors hawk-ai GET /api/mapping/status)."""
+        try:
+            response = {
+                "mapping_running": self.mapper.mapping_running,
+                "mapping_result": self.mapper.mapping_result,
+            }
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
@@ -23,9 +40,13 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 response = {"status": "success", "message": "Mapping stopped"}
                 print_green("Mapping stopped!")
             elif command == 'generate':
-                print_yellow("Generating map...")
-                self.mapper.generate_map()
-                response = {"status": "success", "message": "Map generated"}
+                response = {"status": "error", "message": "Use 'trigger_mapping' command instead"}
+            elif command == 'trigger_mapping':
+                if self.mapper.mapping_running:
+                    response = {"status": "error", "message": "Mapping pipeline already running"}
+                else:
+                    self.mapper.trigger_pipeline()
+                    response = {"status": "success", "message": "Mapping triggered"}
             else:
                 response = {"status": "error", "message": f"Unknown command: {command}"}
             
@@ -63,10 +84,6 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                     for line in lines:
                         if not line.startswith(image_id + ','):
                             f.write(line)
-                
-                # Remove from processed images
-                self.mapper.processed_images = [img for img in self.mapper.processed_images 
-                                              if img.get('image_id') != image_id]
                 
                 response = {"status": "success", "message": f"Image {image_id} deleted"}
                 print_green(f"Image {image_id} deleted")
