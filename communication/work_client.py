@@ -243,7 +243,7 @@ class WorkClient(object):
             "height": height,
             # 'targetId': targetId,
         }
-        print("DATA", data)
+        print("DATA:", data)
 
         response = requests.post(
             f"{self.gs_url}{self.adlc_endp}/{assignment['id']}",

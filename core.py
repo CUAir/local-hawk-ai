@@ -17,6 +17,7 @@ import io
 import base64
 from utils.helper import print_green, print_red, print_yellow
 import time
+import threading
 
 class Mapper:
     def __init__(self, work_client : WorkClient):
@@ -82,8 +83,27 @@ class VisionClient:
         # self.target_attr = self.work_client.get_target_attributes()
         print("Initializing Mapper")
         self.mapper = mapper
-        self.result_interval_seconds = max(0.0, float(result_interval_minutes) * 60.0)
-        self.last_result_send_time = 0.0
+        self.result_interval_seconds = max(1.0, float(result_interval_minutes) * 60.0)
+        self._send_lock = threading.Lock()
+        self._result_scheduler_thread = threading.Thread(
+            target=self._result_scheduler_loop,
+            daemon=True,
+        )
+        self._result_scheduler_thread.start()
+
+    def _result_scheduler_loop(self):
+        while True:
+            time.sleep(self.result_interval_seconds)
+            if not self._send_lock.acquire(blocking=False):
+                print("> send_result() already running, skipping this interval")
+                continue
+            try:
+                print("> [scheduler] Sending result to GS")
+                self.send_result()
+            except Exception as e:
+                print_red(f"Error in send_result scheduler: {e}")
+            finally:
+                self._send_lock.release()
 
     def run_task(self):
         print(">> Running task...")
@@ -93,18 +113,9 @@ class VisionClient:
         time.sleep(1)
         print("> Running model on image")
         self.run_model()
-        print("> Sending result to GS")
-        self.send_result()
-        
-        # now = time.monotonic()
-        # if now - self.last_result_send_time >= self.result_interval_seconds:
-            
-        #     self.last_result_send_time = now
-        # else:
-        #     remaining = int(self.result_interval_seconds - (now - self.last_result_send_time))
-        #     print(f"> Skipping send_result, next send in ~{remaining}s")
+
         print("> Task finished")
-        time.sleep(1) # sleep 2 seconds, blocking
+        time.sleep(1) # sleep 1 second, blocking
 
     # Request image from imaging ground server via work_client.py
     def request_image(self):
@@ -200,10 +211,10 @@ def main(gs_ip_address: str, cs_ip_address : str, map_server_port: int = 8000, r
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
-    parser.add_argument('--gsip', type=str, default="34.73.222.251:8000", help="Specify custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
+    parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
     parser.add_argument('--csip', type=str, default="34.73.222.251:8000", help="Specify custom IP address")
     parser.add_argument('--map-port', type=int, default=8000, help="Port for the map command HTTP server")
-    parser.add_argument('--interval-minutes', type=float, default=0.1, help="Run send_result() every F minutes")
+    parser.add_argument('--interval-minutes', type=float, default=1.0, help="Run send_result() every F minutes")
 
     args = parser.parse_args()
 
@@ -215,3 +226,4 @@ if __name__ == "__main__":
         cs_ip_address = args.csip
 
     main(gs_ip_address, cs_ip_address, args.map_port, args.interval_minutes)
+    
