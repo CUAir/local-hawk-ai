@@ -37,6 +37,7 @@ from stitcher import stitch_geolocated_images
 from dji_dataextraction import process_folder as dji_process_folder, write_metadata_to_csv
 
 REFERENCE_ALTITUDE = 100.0  # meters — altitude-normalization baseline
+MAX_INPUT_DIM_NO_ALT = 2000  # when altitude-based scaling is disabled, cap input dim
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -62,13 +63,31 @@ def _read_csv(csv_path: str) -> Dict[str, Tuple[float, float, float, float]]:
     return metadata
 
 
+MIN_REASONABLE_ALTITUDE = 15.0  # meters; below this we assume telemetry is unreliable
+
+
 def _clamp_altitude_outliers(
     metadata: Dict[str, Tuple[float, float, float, float]],
     tolerance: float = 0.40,
 ) -> Dict[str, Tuple[float, float, float, float]]:
-    """Clamp altitude outliers to median (preserve image coverage, fix scale)."""
+    """Clamp altitude outliers to median (preserve image coverage, fix scale).
+
+    If the median altitude is implausibly low (e.g. non-mapping GoPro telemetry
+    where `altitude` is barometric relative height near 0), fall back to a
+    disabled-scaling regime by zeroing all altitudes — :func:`_resize_image`
+    treats `altitude <= 0` as a no-op.
+    """
     alts = sorted(v[2] for v in metadata.values())
     median_alt = alts[len(alts) // 2]
+    if median_alt < MIN_REASONABLE_ALTITUDE:
+        logging.getLogger(__name__).warning(
+            "Median altitude %.2fm below %.1fm threshold — disabling altitude-based scaling.",
+            median_alt, MIN_REASONABLE_ALTITUDE,
+        )
+        return {
+            img: (lat, lon, 0.0, heading)
+            for img, (lat, lon, _, heading) in metadata.items()
+        }
     return {
         img: (
             lat,
@@ -96,8 +115,19 @@ def _rotate_image(image: np.ndarray, heading_deg: float) -> np.ndarray:
 
 
 def _resize_image(image: np.ndarray, altitude: float) -> np.ndarray:
-    """Scale image proportional to altitude relative to REFERENCE_ALTITUDE."""
+    """Scale image proportional to altitude relative to REFERENCE_ALTITUDE.
+
+    When altitude is non-positive (scaling disabled), enforce a maximum input
+    dimension to keep memory in check for high-resolution cameras (e.g. GoPro
+    27MP frames * 75 images would otherwise exceed RAM).
+    """
     if altitude <= 0:
+        h, w = image.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > MAX_INPUT_DIM_NO_ALT:
+            factor = MAX_INPUT_DIM_NO_ALT / float(max_dim)
+            return cv2.resize(image, None, fx=factor, fy=factor,
+                              interpolation=cv2.INTER_AREA)
         return image
     factor = altitude / REFERENCE_ALTITUDE
     return cv2.resize(image, None, fx=factor, fy=factor)
@@ -133,9 +163,13 @@ class GpsSiftPipeline:
         output_dir: Optional[str] = None,
         test_type: str = "gps_sift",
         verbose: bool = False,
+        min_altitude: Optional[float] = None,
+        require_telemetry: bool = True,
     ):
         self.output_dir = Path(output_dir) if output_dir else None
         self.test_type = test_type
+        self.min_altitude = min_altitude
+        self.require_telemetry = require_telemetry
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def run(self, image_folder: str, csv_path: Optional[str] = None) -> str:
@@ -158,21 +192,44 @@ class GpsSiftPipeline:
             csv_path = str(folder.with_suffix(".csv"))
         if not Path(csv_path).exists():
             self.logger.info("CSV not found at %s — extracting from DJI metadata...", csv_path)
-            rows, stats = dji_process_folder(str(folder))
+            rows, stats = dji_process_folder(
+                str(folder), require_telemetry=self.require_telemetry
+            )
             if not rows:
                 raise RuntimeError("No telemetry found in image XMP/EXIF metadata")
             write_metadata_to_csv(rows, csv_path)
             self.logger.info(
-                "Extracted %d rows → %s  (skipped %d missing lat/lon)",
+                "Extracted %d rows → %s  (skipped: %d missing lat/lon, %d missing altitude, %d missing yaw)",
                 stats["rows_written"],
                 csv_path,
-                stats["missing_latlon"],
+                stats.get("missing_latlon", 0),
+                stats.get("missing_altitude", 0),
+                stats.get("missing_yaw", 0),
             )
 
         # --- Load metadata ---
         metadata = _read_csv(csv_path)
         if not metadata:
             raise ValueError(f"No entries found in CSV: {csv_path}")
+
+        # Drop images captured below a minimum altitude (e.g. takeoff/landing frames).
+        if self.min_altitude is not None:
+            before = len(metadata)
+            metadata = {
+                name: row for name, row in metadata.items()
+                if row[2] >= self.min_altitude
+            }
+            dropped = before - len(metadata)
+            if not metadata:
+                raise ValueError(
+                    f"No images with altitude >= {self.min_altitude:.1f}m "
+                    f"(all {before} rejected)."
+                )
+            self.logger.info(
+                "Altitude filter: kept %d/%d images (>= %.1fm, dropped %d)",
+                len(metadata), before, self.min_altitude, dropped,
+            )
+
         metadata = _clamp_altitude_outliers(metadata)
         self.logger.info("Loaded metadata for %d images", len(metadata))
 
@@ -264,14 +321,41 @@ def main() -> None:
         help="Label used in the output filename: YYYY-MM-DD_HH-MM-SS_<pictureset>_<test-type>.jpg",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--min-altitude",
+        type=float,
+        default=None,
+        help="Reject images with Altitude below this threshold (meters). "
+             "Useful for filtering out takeoff/landing/low-flight frames.",
+    )
+    parser.add_argument(
+        "--min-altitude-ft",
+        type=float,
+        default=None,
+        help="Same as --min-altitude but specified in feet. Overrides --min-altitude.",
+    )
+    parser.add_argument(
+        "--allow-missing-telemetry",
+        dest="require_telemetry",
+        action="store_false",
+        help="Keep rows whose altitude or heading had to be defaulted to 0 "
+             "(i.e. no XMP, EXIF, or sidecar JSON provided them). Default: drop them.",
+    )
+    parser.set_defaults(require_telemetry=True)
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+
+    min_altitude_m = args.min_altitude
+    if args.min_altitude_ft is not None:
+        min_altitude_m = args.min_altitude_ft * 0.3048
 
     pipeline = GpsSiftPipeline(
         output_dir=args.output,
         test_type=args.test_type,
         verbose=args.verbose,
+        min_altitude=min_altitude_m,
+        require_telemetry=args.require_telemetry,
     )
     out_path = pipeline.run(args.image_folder, args.csv)
     print(f"Output: {out_path}")

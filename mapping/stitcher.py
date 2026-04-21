@@ -1,8 +1,16 @@
 import cv2
 import numpy as np
 import gc
+import time
 from typing import List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.linalg import lsqr
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
 
 MAX_CANVAS_DIM = 10000
 NEIGHBOR_RADIUS_M = 150.0
@@ -15,21 +23,23 @@ GPS_DIR_COS_MIN = 0.35    # Require SIFT-predicted direction within ~70° of GPS
 GPS_MAG_MIN = 0.1
 GPS_MAG_MAX = 2.5         # Reject if SIFT says image is >2.5x farther than GPS suggests
 GPS_MIN_DIST_M = 2.0
-GPS_ABS_MAX_M = 30.0              # GPS absolute position tolerance; beyond this, try to GPS-correct rather than reject
+GPS_ABS_MAX_M = 22.0              # GPS absolute position tolerance; beyond this, try to GPS-correct rather than reject
 GPS_ABS_CORRECT_MIN_INLIERS = 30  # If inliers >= this and GPS abs fails, shift chain to GPS position instead of rejecting
-MIN_PLACEMENT_INLIERS = 25        # Minimum RANSAC inliers for passes 2+ (lenient for harder datasets)
+MIN_PLACEMENT_INLIERS = 40        # Minimum RANSAC inliers for passes 2+ (stricter keeps weak chains out of the pose solve)
 MIN_PLACEMENT_INLIERS_PASS1 = 50  # Stricter floor for pass 1 (sparse anchor graph = higher bad-seed risk)
 
 PREVIEW_EVERY = 25
 REFINE_MAX_ITERS = 200
-REFINE_STEP = 0.3         # Larger step works now that initial poses are similarity transforms
+REFINE_STEP = 0.3         # Fallback iterative step if LSQR solve is unavailable
 REFINE_EARLY_STOP = 1e-5
-LAPLACIAN_LEVELS = 7
+LAPLACIAN_LEVELS = 5
 BLEND_MEM_BUDGET = 2.0 * 1024 ** 3   # 2 GB cap for float32 Laplacian accumulator
 NUM_WORKERS = 4           # Parallel workers for feature extraction and warping
 GAIN_COMPENSATION = True  # Normalize per-image brightness before blending
-GAIN_CLIP = (0.5, 2.0)    # Clamp gain to avoid over-correction on outlier exposures
-VORONOI_FEATHER_SIGMA = 10  # 0 = hard Voronoi (binary weights); >0 = Gaussian feather radius in output pixels
+GAIN_CLIP = (0.7, 1.4)    # Clamp gain to avoid over-correction on outlier exposures
+VORONOI_FEATHER_SIGMA = 2   # Seam feather radius; graph-cut seams are already content-clean so 2 is enough
+SEAM_SCALE = 0.25           # Downsample factor for graph-cut seam finding
+GAIN_SCALE = 0.25           # Downsample factor for gain compensator feed
 CLAHE_CLIP = 2.0    # clipLimit for grayscale CLAHE before SIFT detection
 CLAHE_TILE = 8      # tile grid size
 AKAZE_THRESH = 0.005  # AKAZE detector sensitivity (higher = fewer, more reliable keypoints)
@@ -128,6 +138,121 @@ def _match_pair(feat_new, feat_ref):
         return None, None
     return (np.float32(pairs_src).reshape(-1, 1, 2),
             np.float32(pairs_dst).reshape(-1, 1, 2))
+
+
+# ---------------------------------------------------------------------------
+# Direct similarity-pose solve (replaces iterative averaging refinement)
+# ---------------------------------------------------------------------------
+
+def _solve_poses_lsqr(placed_info: Dict,
+                       placement_links: List[Tuple[int, int, np.ndarray]],
+                       anchor_idx: int) -> Dict[int, np.ndarray]:
+    """
+    Global linear least-squares solve for similarity poses.
+
+    Each similarity pose H_i is parametrized as (tx, ty, a, b) where the 2x2
+    block is [[a, -b], [b, a]]. For every placement link (i, j, H_ij), we add
+    the 4 linear equations encoding H_i = H_j @ H_ij. Anchor image is pinned
+    to identity with a high weight. Solved with sparse LSQR.
+
+    Returns: {image_idx: 3x3 similarity H} for every image that appears in any
+    placement link. Images unreachable from placement links are omitted so the
+    caller can keep their original GPS-fallback pose.
+    """
+    if not _SCIPY_AVAILABLE:
+        raise RuntimeError("scipy not available")
+
+    # Only solve for images participating in at least one link (+ anchor)
+    link_images = set()
+    for i, j, _ in placement_links:
+        link_images.add(i)
+        link_images.add(j)
+    link_images.add(anchor_idx)
+    indices = sorted(link_images)
+    idx_to_var = {idx: k for k, idx in enumerate(indices)}
+    n = len(indices)
+    if n == 0:
+        return {}
+
+    rows: List[int] = []
+    cols: List[int] = []
+    vals: List[float] = []
+    rhs: List[float] = []
+    row = 0
+    ANCHOR_WEIGHT = 1e3
+
+    # Anchor: pose at anchor_idx pinned to identity (tx=0, ty=0, a=1, b=0)
+    if anchor_idx in idx_to_var:
+        ka = idx_to_var[anchor_idx]
+        for j, target in ((0, 0.0), (1, 0.0), (2, 1.0), (3, 0.0)):
+            rows.append(row)
+            cols.append(4 * ka + j)
+            vals.append(ANCHOR_WEIGHT)
+            rhs.append(ANCHOR_WEIGHT * target)
+            row += 1
+
+    # Each placement link: H_i = H_j @ H_ij (similarity composition)
+    # Let (ai, bi, txi, tyi) be pose_i and (aij, bij, txij, tyij) come from H_ij.
+    # Composition yields:
+    #   a_i  = aij·a_j - bij·b_j
+    #   b_i  = bij·a_j + aij·b_j
+    #   tx_i = tx_j + txij·a_j - tyij·b_j
+    #   ty_i = ty_j + tyij·a_j + txij·b_j
+    for i, j, H_ij in placement_links:
+        if i not in idx_to_var or j not in idx_to_var:
+            continue
+        ki = idx_to_var[i]
+        kj = idx_to_var[j]
+        aij = float(H_ij[0, 0])
+        bij = float(H_ij[1, 0])
+        txij = float(H_ij[0, 2])
+        tyij = float(H_ij[1, 2])
+
+        # Eq 1 (a): a_i - aij*a_j + bij*b_j = 0
+        rows.extend([row, row, row])
+        cols.extend([4 * ki + 2, 4 * kj + 2, 4 * kj + 3])
+        vals.extend([1.0, -aij, bij])
+        rhs.append(0.0)
+        row += 1
+
+        # Eq 2 (b): b_i - bij*a_j - aij*b_j = 0
+        rows.extend([row, row, row])
+        cols.extend([4 * ki + 3, 4 * kj + 2, 4 * kj + 3])
+        vals.extend([1.0, -bij, -aij])
+        rhs.append(0.0)
+        row += 1
+
+        # Eq 3 (tx): tx_i - tx_j - txij*a_j + tyij*b_j = 0
+        rows.extend([row, row, row, row])
+        cols.extend([4 * ki + 0, 4 * kj + 0, 4 * kj + 2, 4 * kj + 3])
+        vals.extend([1.0, -1.0, -txij, tyij])
+        rhs.append(0.0)
+        row += 1
+
+        # Eq 4 (ty): ty_i - ty_j - tyij*a_j - txij*b_j = 0
+        rows.extend([row, row, row, row])
+        cols.extend([4 * ki + 1, 4 * kj + 1, 4 * kj + 2, 4 * kj + 3])
+        vals.extend([1.0, -1.0, -tyij, -txij])
+        rhs.append(0.0)
+        row += 1
+
+    if row == 0:
+        return {}
+
+    A = csr_matrix((vals, (rows, cols)), shape=(row, 4 * n))
+    b_vec = np.asarray(rhs, dtype=np.float64)
+
+    sol = lsqr(A, b_vec, atol=1e-10, btol=1e-10, iter_lim=4000)
+    x = sol[0]
+
+    new_poses: Dict[int, np.ndarray] = {}
+    for idx, k in idx_to_var.items():
+        tx, ty, a, b = x[4 * k], x[4 * k + 1], x[4 * k + 2], x[4 * k + 3]
+        H = np.array([[a, -b, tx],
+                      [b,  a, ty],
+                      [0,  0, 1.0]], dtype=np.float64)
+        new_poses[idx] = H
+    return new_poses
 
 
 # ---------------------------------------------------------------------------
@@ -350,44 +475,64 @@ def stitch_geolocated_images(images: List[np.ndarray],
             print(f"  Image {i} placed by GPS fallback.")
 
     # --- GLOBAL REFINEMENT ---
-    # Reuse already-computed placement H_rels (no extra SIFT matching needed).
-    print(f"Refining poses with {len(placement_links)} placement constraints...")
-    for iteration in range(REFINE_MAX_ITERS):
-        total_delta, count_delta = 0.0, 0
-        for i, j, H_ij in placement_links:
-            if i not in placed_info or j not in placed_info:
-                continue
-            H_i = placed_info[i]["H"]
-            H_j = placed_info[j]["H"]
+    # Direct linear least-squares solve over similarity poses.
+    # Falls back to the legacy iterative averaging if scipy is unavailable
+    # or the solve fails for any reason.
+    solved_via_lsqr = False
+    if _SCIPY_AVAILABLE and placement_links and placed_indices:
+        anchor_idx = placed_indices[0]
+        print(f"Solving {len(placement_links)} similarity constraints via LSQR (anchor={anchor_idx})...")
+        t_solve = time.time()
+        try:
+            new_poses = _solve_poses_lsqr(placed_info, placement_links, anchor_idx=anchor_idx)
+            updated = 0
+            for idx, H_new in new_poses.items():
+                if idx in placed_info and _valid_H(H_new):
+                    placed_info[idx]["H"] = H_new
+                    updated += 1
+            print(f"  LSQR solved {updated}/{len(new_poses)} poses in {time.time() - t_solve:.2f}s")
+            solved_via_lsqr = True
+        except Exception as e:
+            print(f"  LSQR pose solve failed ({e}); falling back to iterative refinement.")
 
-            try:
-                target_i = H_j.dot(H_ij)
-                new_i = (1 - REFINE_STEP) * H_i + REFINE_STEP * target_i
-                if abs(new_i[2, 2]) > 1e-10:
-                    new_i /= new_i[2, 2]
-                if _valid_H(new_i):
-                    total_delta += float(np.mean(np.abs(new_i - H_i)))
-                    count_delta += 1
-                    placed_info[i]["H"] = new_i
+    if not solved_via_lsqr:
+        print(f"Refining poses with {len(placement_links)} placement constraints (iterative)...")
+        for iteration in range(REFINE_MAX_ITERS):
+            total_delta, count_delta = 0.0, 0
+            for i, j, H_ij in placement_links:
+                if i not in placed_info or j not in placed_info:
+                    continue
+                H_i = placed_info[i]["H"]
+                H_j = placed_info[j]["H"]
 
-                H_ji = np.linalg.inv(H_ij)
-                target_j = placed_info[i]["H"].dot(H_ji)
-                new_j = (1 - REFINE_STEP) * H_j + REFINE_STEP * target_j
-                if abs(new_j[2, 2]) > 1e-10:
-                    new_j /= new_j[2, 2]
-                if _valid_H(new_j):
-                    total_delta += float(np.mean(np.abs(new_j - H_j)))
-                    count_delta += 1
-                    placed_info[j]["H"] = new_j
-            except (np.linalg.LinAlgError, Exception):
-                continue
+                try:
+                    target_i = H_j.dot(H_ij)
+                    new_i = (1 - REFINE_STEP) * H_i + REFINE_STEP * target_i
+                    if abs(new_i[2, 2]) > 1e-10:
+                        new_i /= new_i[2, 2]
+                    if _valid_H(new_i):
+                        total_delta += float(np.mean(np.abs(new_i - H_i)))
+                        count_delta += 1
+                        placed_info[i]["H"] = new_i
 
-        avg_delta = (total_delta / count_delta) if count_delta > 0 else 0.0
-        if (iteration + 1) % 10 == 0:
-            print(f"  Refinement iter {iteration+1}/{REFINE_MAX_ITERS} (avg Δ={avg_delta:.6f})")
-        if avg_delta < REFINE_EARLY_STOP:
-            print(f"  Early stop at iter {iteration+1} (avg Δ={avg_delta:.6f})")
-            break
+                    H_ji = np.linalg.inv(H_ij)
+                    target_j = placed_info[i]["H"].dot(H_ji)
+                    new_j = (1 - REFINE_STEP) * H_j + REFINE_STEP * target_j
+                    if abs(new_j[2, 2]) > 1e-10:
+                        new_j /= new_j[2, 2]
+                    if _valid_H(new_j):
+                        total_delta += float(np.mean(np.abs(new_j - H_j)))
+                        count_delta += 1
+                        placed_info[j]["H"] = new_j
+                except (np.linalg.LinAlgError, Exception):
+                    continue
+
+            avg_delta = (total_delta / count_delta) if count_delta > 0 else 0.0
+            if (iteration + 1) % 10 == 0:
+                print(f"  Refinement iter {iteration+1}/{REFINE_MAX_ITERS} (avg Δ={avg_delta:.6f})")
+            if avg_delta < REFINE_EARLY_STOP:
+                print(f"  Early stop at iter {iteration+1} (avg Δ={avg_delta:.6f})")
+                break
 
     # --- GPS FALLBACK RE-ALIGNMENT ---
     print("Attempting re-alignment of GPS fallback images...")
@@ -648,7 +793,7 @@ def compute_seam_ssim(images, placed_indices, placed_info, positions, sample_pai
 
 
 # ---------------------------------------------------------------------------
-# Assembly: Voronoi seam finding + Laplacian pyramid blending
+# Assembly: content-aware seam finding + Laplacian pyramid blending
 # ---------------------------------------------------------------------------
 
 def _warp_and_dist(args):
@@ -659,6 +804,160 @@ def _warp_and_dist(args):
     mask = np.any(warped > 10, axis=2).astype(np.uint8)
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     return dist  # return dist only; warped is re-computed in phase 2
+
+
+def _warp_at_scale(args):
+    """Warp an image + mask at a downsampled canvas scale, return cropped patch + corner."""
+    img, H_canvas, out_w, out_h, scale = args
+    S = np.diag([scale, scale, 1.0])
+    H_scaled = S.dot(H_canvas)
+    warped = cv2.warpPerspective(img, H_scaled, (out_w, out_h),
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = np.any(warped > 5, axis=2).astype(np.uint8) * 255
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None, None, None
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    return warped[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def _graphcut_seam_masks(images, placed_indices, H_canvases,
+                         canvas_w, canvas_h, seam_scale=SEAM_SCALE):
+    """
+    Content-aware per-image seam masks using cv2.detail.GraphCutSeamFinder.
+
+    Runs at a downsampled canvas scale for memory/speed, then upsamples the
+    resulting binary masks back to full canvas resolution.
+
+    Returns: list of uint8 masks (canvas_h x canvas_w), one per placed image,
+             255 where that image "wins" the seam. None on failure so caller
+             can fall back to the Voronoi label map.
+    """
+    try:
+        # Availability probe
+        _ = cv2.detail.GraphCutSeamFinder("COST_COLOR_GRAD")
+    except (AttributeError, cv2.error) as e:
+        print(f"  GraphCutSeamFinder unavailable ({e}); falling back to Voronoi.")
+        return None
+
+    seam_w = max(1, int(canvas_w * seam_scale))
+    seam_h = max(1, int(canvas_h * seam_scale))
+
+    warp_args = [(images[idx], H_canvases[i], seam_w, seam_h, seam_scale)
+                 for i, idx in enumerate(placed_indices)]
+
+    warps, masks, regions = [], [], []
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        for w, m, r in executor.map(_warp_at_scale, warp_args):
+            warps.append(w)
+            masks.append(m)
+            regions.append(r)
+
+    valid_ks = [k for k, w in enumerate(warps) if w is not None]
+    if len(valid_ks) < 2:
+        return None
+
+    src_list = [warps[k].astype(np.float32) for k in valid_ks]
+    mask_list = [masks[k].copy() for k in valid_ks]
+    corners = [(int(regions[k][0]), int(regions[k][1])) for k in valid_ks]
+
+    try:
+        finder = cv2.detail.GraphCutSeamFinder("COST_COLOR_GRAD")
+        umat_src = [cv2.UMat(s) for s in src_list]
+        umat_masks = [cv2.UMat(m) for m in mask_list]
+        finder.find(umat_src, corners, umat_masks)
+        out_masks = [u.get() for u in umat_masks]
+    except (cv2.error, Exception) as e:
+        print(f"  GraphCutSeamFinder.find failed ({e}); falling back to Voronoi.")
+        return None
+
+    # Place cropped masks back into their seam-scale positions, then upsample
+    full_masks: List[np.ndarray] = [np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+                                     for _ in placed_indices]
+    for local_k, orig_k in enumerate(valid_ks):
+        region = regions[orig_k]
+        if region is None:
+            continue
+        x1, y1, x2, y2 = region
+        small_canvas = np.zeros((seam_h, seam_w), dtype=np.uint8)
+        small_canvas[y1:y2, x1:x2] = out_masks[local_k]
+        full_masks[orig_k] = cv2.resize(small_canvas, (canvas_w, canvas_h),
+                                         interpolation=cv2.INTER_NEAREST)
+    return full_masks
+
+
+def _compute_overlap_gains(images, placed_indices, H_canvases,
+                           canvas_w, canvas_h, gain_scale=GAIN_SCALE):
+    """
+    Per-image exposure gains from cv2.detail.GainCompensator on downsampled warps.
+
+    Returns np.ndarray of length len(placed_indices) with one scalar gain per
+    image, clipped to GAIN_CLIP. Falls back to legacy mean-brightness gains on
+    any failure.
+    """
+    n = len(placed_indices)
+    fallback_gains = np.ones(n, dtype=np.float32)
+
+    try:
+        gain_w = max(1, int(canvas_w * gain_scale))
+        gain_h = max(1, int(canvas_h * gain_scale))
+        warp_args = [(images[idx], H_canvases[i], gain_w, gain_h, gain_scale)
+                     for i, idx in enumerate(placed_indices)]
+        warps, masks, regions = [], [], []
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            for w, m, r in executor.map(_warp_at_scale, warp_args):
+                warps.append(w)
+                masks.append(m)
+                regions.append(r)
+
+        valid_ks = [k for k, w in enumerate(warps) if w is not None]
+        if len(valid_ks) < 2:
+            return fallback_gains
+
+        src_list = [warps[k].astype(np.uint8) for k in valid_ks]
+        mask_list = [masks[k] for k in valid_ks]
+        corners = [(int(regions[k][0]), int(regions[k][1])) for k in valid_ks]
+
+        try:
+            compensator = cv2.detail.GainCompensator(1)
+        except (AttributeError, TypeError):
+            compensator = cv2.detail_GainCompensator(1)
+
+        umat_src = [cv2.UMat(s) for s in src_list]
+        umat_masks = [cv2.UMat(m) for m in mask_list]
+        compensator.feed(corners, umat_src, umat_masks)
+
+        raw_gains = None
+        try:
+            raw_gains = compensator.gains()
+            raw_gains = np.asarray(raw_gains, dtype=np.float32).flatten()
+        except (AttributeError, cv2.error, TypeError):
+            raw_gains = None
+
+        if raw_gains is None or len(raw_gains) != len(valid_ks):
+            # Probe with a uniform image: apply scales pixels by the gain
+            raw_gains = np.ones(len(valid_ks), dtype=np.float32)
+            probe_base = 128
+            for local_k, orig_k in enumerate(valid_ks):
+                probe = np.full((4, 4, 3), probe_base, dtype=np.uint8)
+                probe_mask = np.full((4, 4), 255, dtype=np.uint8)
+                try:
+                    compensator.apply(local_k, corners[local_k], probe, probe_mask)
+                    raw_gains[local_k] = float(np.mean(probe[:, :, 0])) / float(probe_base)
+                except (cv2.error, Exception):
+                    raw_gains[local_k] = 1.0
+
+        gains = np.ones(n, dtype=np.float32)
+        for local_k, orig_k in enumerate(valid_ks):
+            g = float(raw_gains[local_k])
+            if not np.isfinite(g) or g <= 0:
+                g = 1.0
+            gains[orig_k] = float(np.clip(g, GAIN_CLIP[0], GAIN_CLIP[1]))
+        return gains
+    except Exception as e:
+        print(f"  GainCompensator failed ({e}); falling back to mean-brightness gains.")
+        return fallback_gains
 
 
 def _assemble_blended_map(images, placed_indices, placed_info):
@@ -706,33 +1005,39 @@ def _assemble_blended_map(images, placed_indices, placed_info):
     # Pre-compute canvas homographies for all images
     H_canvases = [T.dot(placed_info[idx]["H"]) for idx in placed_indices]
 
-    # --- Phase 1: Build Voronoi label map (parallel warp+dist) ---
-    print(f"Computing Voronoi seam labels ({NUM_WORKERS} workers)...")
-    label_map = np.full((canvas_h, canvas_w), -1, dtype=np.int32)
-    dist_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+    # --- Phase 1: Content-aware seams (graph-cut; Voronoi fallback) ---
+    print(f"Computing graph-cut seam masks (scale={SEAM_SCALE})...")
+    t_seam = time.time()
+    seam_masks = _graphcut_seam_masks(images, placed_indices, H_canvases,
+                                       canvas_w, canvas_h, SEAM_SCALE)
 
-    warp_args = [(idx, images[idx], H_canvases[i], canvas_w, canvas_h)
-                 for i, idx in enumerate(placed_indices)]
+    label_map = None
+    if seam_masks is None:
+        print(f"  Falling back to Voronoi seam labels ({NUM_WORKERS} workers)...")
+        label_map = np.full((canvas_h, canvas_w), -1, dtype=np.int32)
+        dist_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        for i, dist in enumerate(executor.map(_warp_and_dist, warp_args)):
-            update = dist > dist_map
-            dist_map[update] = dist[update]
-            label_map[update] = i
-    del dist_map
+        warp_args = [(idx, images[idx], H_canvases[i], canvas_w, canvas_h)
+                     for i, idx in enumerate(placed_indices)]
 
-    # --- Gain compensation: normalize per-image brightness to global median ---
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            for i, dist in enumerate(executor.map(_warp_and_dist, warp_args)):
+                update = dist > dist_map
+                dist_map[update] = dist[update]
+                label_map[update] = i
+        del dist_map
+    else:
+        print(f"  Graph-cut seams done in {time.time() - t_seam:.2f}s")
+
+    # --- Gain compensation: overlap-based (falls back to mean-brightness) ---
     gains = np.ones(len(placed_indices), dtype=np.float32)
     if GAIN_COMPENSATION:
-        brightnesses = []
-        for idx in placed_indices:
-            b = float(np.mean(images[idx].astype(np.float32)))
-            brightnesses.append(b)
-        target_brightness = float(np.median(brightnesses))
-        for k, b in enumerate(brightnesses):
-            if b > 1.0:
-                gains[k] = float(np.clip(target_brightness / b,
-                                         GAIN_CLIP[0], GAIN_CLIP[1]))
+        print(f"Computing overlap-based gain compensation (scale={GAIN_SCALE})...")
+        t_gain = time.time()
+        gains = _compute_overlap_gains(images, placed_indices, H_canvases,
+                                        canvas_w, canvas_h, GAIN_SCALE)
+        print(f"  Gains computed in {time.time() - t_gain:.2f}s "
+              f"(range {float(gains.min()):.3f}..{float(gains.max()):.3f})")
 
     # --- Phase 2: Laplacian pyramid blend (streaming accumulator) ---
     print(f"Building {LAPLACIAN_LEVELS}-level Laplacian pyramid accumulator...")
@@ -759,16 +1064,19 @@ def _assemble_blended_map(images, placed_indices, placed_info):
         # Apply per-image gain correction
         warped *= gains[i]
 
-        # Feathered Voronoi weight: Gaussian-blur the binary mask to soften seam edges
-        voronoi_w = (label_map == i).astype(np.float32)
+        # Feathered seam weight: Gaussian-blur the binary win-mask to soften edges
+        if seam_masks is not None:
+            seam_w = (seam_masks[i] > 0).astype(np.float32)
+        else:
+            seam_w = (label_map == i).astype(np.float32)
         if VORONOI_FEATHER_SIGMA > 0:
-            voronoi_w = cv2.GaussianBlur(voronoi_w, (0, 0), float(VORONOI_FEATHER_SIGMA))
+            seam_w = cv2.GaussianBlur(seam_w, (0, 0), float(VORONOI_FEATHER_SIGMA))
 
         # Build pyramids
         lp = _build_laplacian_pyramid(warped, LAPLACIAN_LEVELS, level_shapes)
         del warped
-        gp_w = _build_gaussian_pyramid(voronoi_w, LAPLACIAN_LEVELS, level_shapes)
-        del voronoi_w
+        gp_w = _build_gaussian_pyramid(seam_w, LAPLACIAN_LEVELS, level_shapes)
+        del seam_w
 
         # Accumulate weighted Laplacian and weight sum for normalization
         for lvl in range(LAPLACIAN_LEVELS):
@@ -783,7 +1091,11 @@ def _assemble_blended_map(images, placed_indices, placed_info):
         if (i + 1) % 50 == 0:
             print(f"  Blended {i+1}/{len(placed_indices)} images...")
 
-    del label_map
+    if label_map is not None:
+        del label_map
+    if seam_masks is not None:
+        del seam_masks
+    gc.collect()
 
     # Reconstruct from normalized Laplacian pyramid
     # Normalize each level: weighted_laplacian / weight_sum before reconstruction

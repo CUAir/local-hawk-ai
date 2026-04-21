@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 from pathlib import Path
@@ -187,10 +188,52 @@ def extract_exif_metadata(image_path: str) -> Dict[str, object]:
     return out
 
 
+def extract_gs_json_metadata(image_path: str) -> Dict[str, object]:
+    """Extract telemetry from a GoPro-style sidecar JSON (``<image>_gs.json``).
+
+    Produces keys aligned with the DJI XMP schema so :func:`normalize_row`
+    can consume it unchanged. ``telemetry.altitude`` in these files is a
+    low, relative height; callers may choose to override/zero it before
+    writing the CSV.
+    """
+    p = Path(image_path)
+    json_path = p.with_name(f"{p.stem}_gs.json")
+    if not json_path.exists():
+        return {}
+    try:
+        data = json.loads(json_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.debug("Failed to read %s: %s", json_path, exc)
+        return {}
+
+    tel = data.get("telemetry") or {}
+    gps = tel.get("gps") or {}
+
+    out: Dict[str, object] = {}
+    lat = _safe_float(gps.get("latitude"))
+    lon = _safe_float(gps.get("longitude"))
+    alt = _safe_float(tel.get("altitude"))
+    yaw = _safe_float(tel.get("planeYaw"))
+    ts = data.get("timestamp_utc") or data.get("timestamp")
+
+    if lat is not None:
+        out["GpsLatitude"] = lat
+    if lon is not None:
+        out["GpsLongitude"] = lon
+    if alt is not None:
+        out["AbsoluteAltitude"] = alt
+    if yaw is not None:
+        out["FlightYawDegree"] = yaw
+    if ts is not None:
+        out["DateTimeOriginal"] = str(ts)
+    return out
+
+
 def extract_telemetry(image_path: str) -> Tuple[Dict[str, object], Dict[str, bool]]:
-    """Extract merged telemetry with XMP-first, EXIF fallback."""
+    """Extract merged telemetry with XMP-first, EXIF+sidecar JSON fallback."""
     xmp = extract_dji_xmp_metadata(image_path)
     exif = extract_exif_metadata(image_path)
+    gs_json = extract_gs_json_metadata(image_path)
 
     meta: Dict[str, object] = {}
     meta.update(xmp)
@@ -205,18 +248,42 @@ def extract_telemetry(image_path: str) -> Tuple[Dict[str, object], Dict[str, boo
     if "FlightYawDegree" not in meta and "GimbalYawDegree" not in meta and "GPSImgDirection" in exif:
         meta["FlightYawDegree"] = exif["GPSImgDirection"]
 
+    # Fill from GoPro sidecar JSON last (lowest priority) so DJI/EXIF win if present.
+    if "GpsLatitude" not in meta and "GpsLatitude" in gs_json:
+        meta["GpsLatitude"] = gs_json["GpsLatitude"]
+    if "GpsLongitude" not in meta and "GpsLongitude" in gs_json:
+        meta["GpsLongitude"] = gs_json["GpsLongitude"]
+    if ("RelativeAltitude" not in meta and "AbsoluteAltitude" not in meta
+            and "AbsoluteAltitude" in gs_json):
+        meta["AbsoluteAltitude"] = gs_json["AbsoluteAltitude"]
+    if ("FlightYawDegree" not in meta and "GimbalYawDegree" not in meta
+            and "FlightYawDegree" in gs_json):
+        meta["FlightYawDegree"] = gs_json["FlightYawDegree"]
+    if "DateTimeOriginal" not in meta and "DateTimeOriginal" in gs_json:
+        meta["DateTimeOriginal"] = gs_json["DateTimeOriginal"]
+
     if "DateTimeOriginal" in exif:
         meta["DateTimeOriginal"] = exif["DateTimeOriginal"]
 
     sources = {
         "xmp": bool(xmp),
         "exif": bool(exif),
+        "gs_json": bool(gs_json),
     }
     return meta, sources
 
 
-def normalize_row(filename: str, telemetry: Dict[str, object]) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
-    """Map merged metadata into pipeline CSV row schema."""
+def normalize_row(
+    filename: str,
+    telemetry: Dict[str, object],
+    require_telemetry: bool = False,
+) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
+    """Map merged metadata into pipeline CSV row schema.
+
+    If ``require_telemetry`` is True, rows missing altitude OR heading from
+    any real source (i.e. would otherwise be silently defaulted to 0.0) are
+    rejected, returning ``(None, 'missing_<field>')``.
+    """
     lat = _safe_float(telemetry.get("GpsLatitude"))
     lon = _safe_float(telemetry.get("GpsLongitude"))
     if lat is None or lon is None:
@@ -225,14 +292,22 @@ def normalize_row(filename: str, telemetry: Dict[str, object]) -> Tuple[Optional
     alt = _safe_float(telemetry.get("RelativeAltitude"))
     if alt is None:
         alt = _safe_float(telemetry.get("AbsoluteAltitude"))
+    alt_defaulted = alt is None
     if alt is None:
         alt = 0.0
 
     yaw = _safe_float(telemetry.get("FlightYawDegree"))
     if yaw is None:
         yaw = _safe_float(telemetry.get("GimbalYawDegree"))
+    yaw_defaulted = yaw is None
     if yaw is None:
         yaw = 0.0
+
+    if require_telemetry:
+        if alt_defaulted:
+            return None, "missing_altitude"
+        if yaw_defaulted:
+            return None, "missing_yaw"
 
     ts = str(telemetry.get("DateTimeOriginal", "")).strip()
 
@@ -264,8 +339,14 @@ def process_folder(
     recursive: bool = False,
     extensions: Tuple[str, ...] = DEFAULT_EXTENSIONS,
     sort_by: str = "datetime",
+    require_telemetry: bool = False,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
-    """Process images and return normalized CSV rows plus stats."""
+    """Process images and return normalized CSV rows plus stats.
+
+    When ``require_telemetry`` is True, rows whose altitude or yaw would be
+    silently defaulted are dropped (counted under ``missing_altitude`` /
+    ``missing_yaw``).
+    """
     base = Path(folder_path)
     if not base.exists() or not base.is_dir():
         raise FileNotFoundError(f"Folder path does not exist or is not a directory: {folder_path}")
@@ -275,7 +356,10 @@ def process_folder(
         "rows_written": 0,
         "xmp_source": 0,
         "exif_source": 0,
+        "gs_json_source": 0,
         "missing_latlon": 0,
+        "missing_altitude": 0,
+        "missing_yaw": 0,
         "fallback_altitude": 0,
         "fallback_yaw": 0,
     }
@@ -288,11 +372,17 @@ def process_folder(
             stats["xmp_source"] += 1
         if sources["exif"]:
             stats["exif_source"] += 1
+        if sources.get("gs_json"):
+            stats["gs_json_source"] += 1
 
-        row, reason = normalize_row(path.name, telemetry)
+        row, reason = normalize_row(path.name, telemetry, require_telemetry=require_telemetry)
         if row is None:
             if reason == "missing_latlon":
                 stats["missing_latlon"] += 1
+            elif reason == "missing_altitude":
+                stats["missing_altitude"] += 1
+            elif reason == "missing_yaw":
+                stats["missing_yaw"] += 1
             continue
 
         if _safe_float(telemetry.get("RelativeAltitude")) is None and _safe_float(telemetry.get("AbsoluteAltitude")) is None:
@@ -394,6 +484,12 @@ def main() -> None:
         action="store_true",
         help="Fail if any input images were skipped due to missing lat/lon",
     )
+    parser.add_argument(
+        "--require-telemetry",
+        action="store_true",
+        help="Reject rows whose altitude or heading would be silently defaulted to 0 "
+             "(i.e. neither XMP, EXIF, nor sidecar JSON provided them).",
+    )
     args = parser.parse_args()
 
     folder_path = args.image_folder
@@ -405,15 +501,21 @@ def main() -> None:
         recursive=bool(args.recursive),
         extensions=extensions,
         sort_by=args.sort_by,
+        require_telemetry=bool(args.require_telemetry),
     )
 
     logger.info(
-        "Telemetry summary: files=%d rows=%d xmp=%d exif=%d missing_latlon=%d fallback_altitude=%d fallback_yaw=%d",
+        "Telemetry summary: files=%d rows=%d xmp=%d exif=%d gs_json=%d "
+        "missing_latlon=%d missing_altitude=%d missing_yaw=%d "
+        "fallback_altitude=%d fallback_yaw=%d",
         stats["files_seen"],
         stats["rows_written"],
         stats["xmp_source"],
         stats["exif_source"],
+        stats["gs_json_source"],
         stats["missing_latlon"],
+        stats["missing_altitude"],
+        stats["missing_yaw"],
         stats["fallback_altitude"],
         stats["fallback_yaw"],
     )
