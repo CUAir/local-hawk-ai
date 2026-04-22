@@ -9,11 +9,7 @@ import base64
 from io import BytesIO
 from typing import Tuple, List
 from enum import Enum
-
-class LabelTypes(Enum):
-    TENT = "tent"
-    MANNEQUIN = "mannequin"
-    UNKNOWN = "unknown"
+from constructs.image_types import Base64Image, CandidateImage, LabelTypes
 
 
 # Text prompt given to DINO.  Periods separate distinct concepts.
