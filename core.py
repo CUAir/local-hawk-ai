@@ -21,6 +21,11 @@ import base64
 from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
+from constructs.detection import GDDetection
+
+
+GD_model = GDDetection()
+
 
 # Mapping pipeline constants (mirrors hawk-ai/main.py)
 MAPPING_SESSION_DIR = Path(__file__).parent / "mapping" / "current_session"
