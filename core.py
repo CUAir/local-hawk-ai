@@ -4,6 +4,7 @@ from models.detectors import MaskRCNN
 from vision.detectors.abstract_detector import AbstractDetector
 from vision.classifiers.abstract_classifier import AbstractClassifier
 from constructs.classification import Classification, LabelType
+from constructs.roi import ROI
 import argparse
 import PIL.Image as Image
 from multiprocessing import Process
@@ -22,10 +23,16 @@ from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
 from constructs.detection import GDDetection
+from constructs.image_types import Base64Image, LabelTypes
+
+
+# Keep color only for section headers; all other logs are plain text.
+header = print_green
 
 
 GD_model = GDDetection()
 
+MAX_BOX_FRACTION = 0.5
 
 # Mapping pipeline constants (mirrors hawk-ai/main.py)
 MAPPING_SESSION_DIR = Path(__file__).parent / "mapping" / "current_session"
@@ -90,10 +97,10 @@ def _save_image_for_mapping_local(image: Image.Image, metadata: dict) -> bool:
                 "Altitude": alt,
                 "Degrees_Clockwise_from_North": yaw,
             })
-        print_green(f"[mapping] Saved {img_filename} to session")
+        print(f"[mapping] Saved {img_filename} to session")
         return True
     except Exception as e:
-        print_yellow(f"[mapping] Failed to save image {metadata.get('id')}: {e}")
+        print_red(f"[mapping] Failed to save image {metadata.get('id')}: {e}")
         return False
 
 
@@ -125,7 +132,7 @@ def _run_pipeline_local(mapper) -> None:
         )
         Path(raw_path).rename(final_out)
         mapper.mapping_result = final_out
-        print_green(f"[mapping] Done → {final_out}")
+        print(f"[mapping] Done → {final_out}")
     except Exception as e:
         print_red(f"[mapping] Pipeline error: {e}")
     finally:
@@ -153,7 +160,7 @@ class Mapper:
             print_yellow("[mapping] Pipeline already running — ignoring trigger")
             return
         threading.Thread(target=_run_pipeline_local, args=(self,), daemon=True).start()
-        print_green("[mapping] Pipeline triggered in background thread")
+        print("[mapping] Pipeline triggered in background thread")
 
     def mark_image_received(self):
         """Record timestamp of the latest received image."""
@@ -173,21 +180,21 @@ class Mapper:
             return
         if time.time() - self.last_auto_trigger_ts < timeout_seconds:
             return
-        print_green(
+        print(
             f"[mapping] Idle for {timeout_seconds}s with {n_images} images; auto-triggering pipeline"
         )
         self.last_auto_trigger_ts = time.time()
         self.trigger_pipeline()
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper, result_interval_minutes: float = 5.0):
-        print("Initializing Work Client")
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_interval_seconds: float = 10.0):
+        header("\n[vision] Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
         # self.target_attr = self.work_client.get_target_attributes()
-        print("Initializing Mapper")
+        header("[vision] Initializing Mapper")
         self.mapper = mapper
-        self.result_interval_seconds = max(1.0, float(result_interval_minutes) * 60.0)
+        self.result_interval_seconds = max(1.0, float(result_interval_seconds))
         self._send_lock = threading.Lock()
         self._result_scheduler_thread = threading.Thread(
             target=self._result_scheduler_loop,
@@ -195,31 +202,45 @@ class VisionClient:
         )
         self._result_scheduler_thread.start()
 
+        # GD backup: best detected candidate per label from the most recent image
+        self._gd_best_mannequin: tuple = None  # (assignment, ROI, Classification)
+        self._gd_best_tent: tuple = None        # (assignment, ROI, Classification)
+
     def _result_scheduler_loop(self):
         while True:
-            time.sleep(self.result_interval_seconds)
+            remaining = int(self.result_interval_seconds)
+            while remaining > 0:
+                # Log every 5 seconds, then every second in the last 5 seconds.
+                if remaining <= 5 or remaining % 5 == 0:
+                    print(f"[scheduler] Next GS send in {remaining}s")
+                time.sleep(1)
+                remaining -= 1
+
             if not self._send_lock.acquire(blocking=False):
-                print("> send_result() already running, skipping this interval")
+                print_yellow("[scheduler] send_result() already running; skipping this tick")
                 continue
             try:
-                print("> [scheduler] Sending result to GS")
+                print_green("\n[scheduler] Sending current results to GS")
                 self.send_result()
             except Exception as e:
-                print_red(f"Error in send_result scheduler: {e}")
+                print_red(f"[scheduler] send_result() failed: {e}")
             finally:
                 self._send_lock.release()
 
     def run_task(self):
-        print(">> Running task...")
+        print("\n[worker] Starting task cycle ========")
         
-        print("> Requesting image")
+        print_green("[worker] Requesting image from imaging GS")
         self.request_image()
         time.sleep(1)
-        print("> Running model on image")
+        print_yellow("[worker] Uploading image + running backup detection")
         self.run_model()
 
-        print("> Task finished")
+        print("[worker] Task cycle complete ========\n")
         time.sleep(1) # sleep 1 second, blocking
+
+
+    
 
     # Request image from imaging ground server via work_client.py
     def request_image(self):
@@ -242,33 +263,129 @@ class VisionClient:
 
     # Perform autonomous detection and classification
     def run_model(self):
-        response = self.work_client.send_image(self.image, self.assignment)
-        print(f"> GET Response: {response.status_code}")
+        self.gd_backup()
+        try:
+            response = self.work_client.send_image(self.image, self.assignment)
+            if 200 <= response.status_code < 300:
+                print(f"[cloud] Image upload accepted (status={response.status_code})")
+            else:
+                print_red(f"[cloud] Image upload failed (status={response.status_code})")
+        except Exception as e:
+            print_red(f"[cloud] Image upload failed: {e}")
+    
+    def gd_backup(self):
+        """Run GroundingDINO on the current image and cache the highest-scoring
+        candidate for each of MANNEQUIN and TENT as a fallback in case the
+        cloud server has no result (204)."""
+        if self.image is None or self.assignment is None:
+            return
+
+        import io as _io
+        import base64 as _b64
+
+        # Convert PIL image -> Base64Image so detect_candidates can consume it
+        buf = _io.BytesIO()
+        self.image.save(buf, format="JPEG")
+        img_b64_str = _b64.b64encode(buf.getvalue()).decode("utf-8")
+        base64_image = Base64Image(
+            id=self.assignment["id"],
+            base64_image=img_b64_str,
+            assignment=self.assignment,
+        )
+
+        try:
+            candidates = GD_model.detect_candidates(
+                base64_image,
+                max_box_fraction=MAX_BOX_FRACTION,
+                save_file=False,
+            )
+        except Exception as e:
+            print_red(f"[gd_backup] Detection failed: {e}")
+            return
+
+        print_green(f"[gd_backup] Detection complete: {len(candidates)} candidate(s)")
+
+        best_mannequin = None
+        best_tent = None
+
+        for candidate in candidates:
+            if candidate.label == LabelTypes.MANNEQUIN:
+                if best_mannequin is None or candidate.score > best_mannequin.score:
+                    best_mannequin = candidate
+            elif candidate.label == LabelTypes.TENT:
+                if best_tent is None or candidate.score > best_tent.score:
+                    best_tent = candidate
+
+        def _candidate_to_roi_classification(candidate, label_type):
+            """Convert a CandidateImage into (ROI, Classification) using the source PIL image."""
+            x1, y1, x2, y2 = candidate.bbox
+            source_pil = self.image
+            cropped = source_pil.crop((x1, y1, x2, y2))
+            roi = ROI(roi=cropped, top_left=(x1, y1), bottom_right=(x2, y2))
+            classification = Classification(label=label_type, number_conf=candidate.score)
+            return roi, classification
+
+        if best_mannequin is not None:
+            roi, clf = _candidate_to_roi_classification(best_mannequin, LabelType.MANNEQUIN)
+            self._gd_best_mannequin = (self.assignment, roi, clf)
+            print(f"[gd_backup] Cached mannequin candidate (score={best_mannequin.score:.3f})")
+        else:
+            print_yellow("[gd_backup] No mannequin candidate found in current image")
+
+        if best_tent is not None:
+            roi, clf = _candidate_to_roi_classification(best_tent, LabelType.TENT)
+            self._gd_best_tent = (self.assignment, roi, clf)
+            print(f"[gd_backup] Cached tent candidate (score={best_tent.score:.3f})")
+        else:
+            print_yellow("[gd_backup] No tent candidate found in current image")
+
 
     # Send result of detection and classification to GS
     def send_result(self):
+        def _send_with_log(target_name: str, assignment, roi, classification, source: str):
+            try:
+                response = self.work_client.send_adlc_output(assignment, roi, classification)
+                if 200 <= response.status_code < 300:
+                    print(
+                        f"[send_result] Sent {target_name} using {source} image (assignment_id={assignment.get('id')}, status={response.status_code})"
+                    )
+                else:
+                    print_red(
+                        f"[send_result] Failed to send {target_name} using {source} image (assignment_id={assignment.get('id')}, status={response.status_code})"
+                    )
+            except Exception as e:
+                print_red(f"[send_result] Exception while sending {target_name} using {source} image: {e}")
+
+        print("[send_result] Getting MANNEQUIN image")
         m_assignment, m_roi, m_classification = self.work_client.get_mannequin_image()
+        print("[send_result] Getting TENT image")
         t_assignment, t_roi, t_classification = self.work_client.get_tent_image()
         
 
+        # Mannequin: prefer cloud server result; fall back to GD backup on 204
         if m_assignment is not None and m_roi is not None and m_classification is not None:
-            print("> Sending mannequin image")
-            self.work_client.send_adlc_output(
-                m_assignment, m_roi, m_classification
-            )
+            print_green("[send_result] mannequin source = server")
+            _send_with_log("mannequin", m_assignment, m_roi, m_classification, "server")
+        elif self._gd_best_mannequin is not None:
+            print_yellow("[send_result] mannequin source = cached (GD backup)")
+            gd_assign, gd_roi, gd_clf = self._gd_best_mannequin
+            _send_with_log("mannequin", gd_assign, gd_roi, gd_clf, "cached")
         else:
-            print("> No valid mannequin image to send")
+            print_red("[send_result] No mannequin candidate available to send")
 
+        # Tent: prefer cloud server result; fall back to GD backup on 204
         if t_assignment is not None and t_roi is not None and t_classification is not None:
-            print("> Sending tent image")
-            self.work_client.send_adlc_output(
-                t_assignment, t_roi, t_classification
-            )
+            print_green("[send_result] tent source = server")
+            _send_with_log("tent", t_assignment, t_roi, t_classification, "server")
+        elif self._gd_best_tent is not None:
+            print_yellow("[send_result] tent source = cached (GD backup)")
+            gd_assign, gd_roi, gd_clf = self._gd_best_tent
+            _send_with_log("tent", gd_assign, gd_roi, gd_clf, "cached")
         else:
-            print("> No valid tent image to send")
-
+            print_red("[send_result] No tent candidate available to send")
+        print("[send_result] DONE SENDING RESULTS ========= ")
 def start_mapping_server(mapper: Mapper, port=8000):
-    print_green(f"Map HTTP server started on port {port}!")
+    header(f"\n[mapping] Map HTTP server started on port {port}")
 
     # Set the mapper in the handler class
     MapCommandHandler.mapper = mapper
@@ -281,14 +398,14 @@ def start_mapping_server(mapper: Mapper, port=8000):
     except Exception as e:
         print_red(f"Error in map HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper, result_interval_minutes: float = 5.0):
-    print("Starting Worker process...")
-    worker = VisionClient(work_client, mapper, result_interval_minutes)
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_interval_seconds: float = 10.0):
+    header("\n[worker] Starting worker loop")
+    worker = VisionClient(work_client, mapper, result_interval_seconds)
     while True:
         try:
             worker.run_task()
         except Exception as e:
-            print_red(f"Error in Worker process: {e}")
+            print_red(f"[worker] Unhandled worker error: {e}")
 
 
 def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
@@ -296,8 +413,8 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
     if timeout_seconds <= 0:
         print_yellow("[mapping] Idle monitor disabled (--map-idle-timeout=0)")
         return
-    print_green(
-        f"[mapping] Idle monitor started (timeout={timeout_seconds}s)"
+    header(
+        f"\n[mapping] Idle monitor started (timeout={timeout_seconds}s)"
     )
     while True:
         try:
@@ -306,7 +423,11 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
             print_yellow(f"[mapping] Idle monitor error: {e}")
         time.sleep(IDLE_MAPPING_POLL_SECONDS)
 
-def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, result_interval_minutes: float = 5.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS):
+def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, result_interval_seconds: float = 10.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS):
+    header(
+        f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
+        f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s"
+    )
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
     mapper = Mapper(work_client)
@@ -319,7 +440,7 @@ def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, re
     threading.Thread(target=idle_mapping_monitor_loop, args=(mapper, map_idle_timeout), daemon=True).start()
 
     # TODO: implement MP, not doing it right now to see errors clearly
-    worker_loop(work_client, mapper, result_interval_minutes)
+    worker_loop(work_client, mapper, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
@@ -343,9 +464,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
     parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
-    parser.add_argument('--csip', type=str, default="34.73.222.251:8000", help="Specify cloud server custom IP address")
+    parser.add_argument('--csip', type=str, default="34.106.113.118:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8000, help="Port for the map command HTTP server")
-    parser.add_argument('--interval-minutes', type=float, default=1.0, help="Run send_result() every F minutes")
+    parser.add_argument('--interval-seconds', type=float, default=20.0, help="Run send_result() every F seconds")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
 
@@ -358,4 +479,4 @@ if __name__ == "__main__":
         gs_ip_address = args.gsip
         cs_ip_address = args.csip
 
-    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_minutes, args.map_idle_timeout)
+    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_seconds, args.map_idle_timeout)

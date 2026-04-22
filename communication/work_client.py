@@ -3,6 +3,10 @@ from PIL import Image
 from constructs.roi import ROI
 from constructs.classification import Classification, LabelType
 import base64
+from utils.helper import print_green, print_yellow, print_red
+
+
+# Keep WorkClient logs plain to avoid excessive terminal coloring.
 
 class WorkClient(object):
 
@@ -24,9 +28,11 @@ class WorkClient(object):
         self.client_header = {"id": 1, "username": "adlc",
                         "address": "", "userType": "ADLC"}
         self.auth_headers = {"Username": "adlc"}
+        self.http_timeout_seconds = 5
 
     def _decode_base64_image(self, image_b64: str) -> typing.Optional[Image.Image]:
         if not image_b64:
+            print_yellow("[work_client] Empty base64 payload; cannot decode image")
             return None
 
         # Support either raw base64 or data URLs (data:image/jpeg;base64,...)
@@ -35,7 +41,7 @@ class WorkClient(object):
             image_bytes = base64.b64decode(payload)
             return Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
-            print(f"Failed to decode base64 image: {e}")
+            print_red(f"[work_client] Failed to decode base64 image: {e}")
             return None
 
     def _parse_label(self, raw_label: typing.Any) -> LabelType:
@@ -57,16 +63,17 @@ class WorkClient(object):
         self, response: requests.Response
     ) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification]]:
         if response.status_code == 204:
+            print("[work_client] Candidate endpoint returned 204 (no content yet)")
             return None, None, None
 
         if response.status_code != 200:
-            print(f"Failed to get best image. Status: {response.status_code}")
+            print_red(f"[work_client] Failed to get candidate image (status={response.status_code})")
             return None, None, None
 
         try:
             candidate = response.json()
         except Exception as e:
-            print(f"Invalid JSON response: {e}")
+            print_red(f"[work_client] Invalid candidate JSON response: {e}")
             return None, None, None
 
         bbox = candidate.get("bbox") or []
@@ -79,14 +86,14 @@ class WorkClient(object):
         full_image = self._decode_base64_image(source_b64)
 
         if full_image is None or len(bbox) != 4:
-            print("Candidate image missing valid source image or bbox")
+            print_yellow("[work_client] Candidate missing valid source image or 4-value bbox")
             return assignment, None, None
         
         width, height = full_image.size
         try:
             x1, y1, x2, y2 = [int(v) for v in bbox]
         except Exception:
-            print(f"Invalid bbox format: {bbox}")
+            print_red(f"[work_client] Invalid bbox format: {bbox}")
             return assignment, None, None
 
         x1 = max(0, min(x1, width - 1))
@@ -95,7 +102,7 @@ class WorkClient(object):
         y2 = max(0, min(y2, height))
 
         if x2 <= x1 or y2 <= y1:
-            print(f"Degenerate bbox after clipping: {[x1, y1, x2, y2]}")
+            print_yellow(f"[work_client] Degenerate bbox after clipping: {[x1, y1, x2, y2]}")
             return assignment, None, None
 
         roi_image = full_image.crop((x1, y1, x2, y2))
@@ -114,7 +121,7 @@ class WorkClient(object):
             response = requests.get(self.gs_url + self.attribute_endp)
             status_code, attrs = response.status_code, dict(response.json())
             if status_code != 200 or not attrs:
-                print(f"Waiting for attributes -- Status: {status_code}")
+                print_yellow(f"[work_client] Waiting for target attributes (status={status_code})")
                 time.sleep(2)
                 continue
             else:
@@ -122,9 +129,7 @@ class WorkClient(object):
                 for id, target in attrs.items():
                     desc = [s.upper() for s in target.values()]
                     attrs_formatted[id] = desc
-                    print(
-                        f"Received ID: {id} -- {desc[1]} {desc[0]} with a {desc[3]} {desc[2]}"
-                    )
+                    print(f"[work_client] Target {id}: {desc[1]} {desc[0]} with {desc[3]} {desc[2]}")
                 return attrs_formatted
 
     def get_image_assignment(self) -> typing.Tuple[typing.Dict[str, str], typing.Dict[str, str]]:
@@ -139,11 +144,10 @@ class WorkClient(object):
             response = requests.post(
                 self.gs_url + self.work_endp, headers=self.auth_headers
             )
-            print("> GS IP:", self.gs_url + self.work_endp)
             status_code = response.status_code
-            print("> Work Status Code:", status_code)
+            print(f"[work_client] Polled work endpoint: {self.gs_url + self.work_endp} (status={status_code})")
             if status_code == 204:  # successful request, no content
-                print("Waiting for work")
+                print("[work_client] No work assignment available yet")
                 time.sleep(2)
                 continue
             elif status_code == 200:  # successful request, received image metadata
@@ -156,11 +160,10 @@ class WorkClient(object):
                     "telemetry": meta["image"]["telemetry"],
                     "imgMode": meta["image"]["imgMode"],
                 }
-                print(f"Work received: {data}")
-                print("ASSIGNMENT:", assignment) # TODO: remove
+                print(f"[work_client] Received assignment {data['id']} (endpoint={data['endpoint']})")
                 return assignment, data
             else:
-                print("Unsuccessful request")
+                print_red(f"[work_client] Work request failed (status={status_code})")
                 break
 
     def get_image(self, img_endpoint: str) -> Image.Image:
@@ -171,12 +174,21 @@ class WorkClient(object):
         response = requests.get(self.gs_url + img_endpoint)
 
         if response.status_code == 200:
-            return Image.open(io.BytesIO(response.content))
+            image = Image.open(io.BytesIO(response.content))
+            print(f"[work_client] Received image from GS endpoint: {img_endpoint}")
+            return image
         else:
-            print("Failed to get image")
+            print_red(f"[work_client] Failed to fetch image from GS (status={response.status_code}, endpoint={img_endpoint})")
             return None
         
     def send_image(self, img: Image.Image, assignment: dict) -> requests.Response:
+        if img is None:
+            print_red("[work_client] Cannot send image to cloud: image is None")
+            raise ValueError("img cannot be None")
+        if assignment is None or "id" not in assignment:
+            print_red("[work_client] Cannot send image to cloud: missing assignment or assignment id")
+            raise ValueError("assignment with id is required")
+
         buffer = io.BytesIO()
         img_format = img.format if img.format else "PNG"
         img.save(buffer, format=img_format)
@@ -187,21 +199,43 @@ class WorkClient(object):
         # Send request to cloud server
         response = requests.post(
             self.cs_url + self.upload_img_endp,
-            json=payload  # automatically sets Content-Type: application/json
+            json=payload,  # automatically sets Content-Type: application/json
+            timeout=self.http_timeout_seconds,
         )
+
+        if 200 <= response.status_code < 300:
+            print(f"[work_client] Uploaded image to cloud (assignment_id={assignment['id']}, status={response.status_code})")
+        else:
+            print_red(f"[work_client] Cloud upload failed (assignment_id={assignment['id']}, status={response.status_code})")
 
         return response
 
     def get_tent_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification]]:
-        response = requests.get(self.cs_url + self.tent_img_endp)
+        try:
+            response = requests.get(
+                self.cs_url + self.tent_img_endp,
+                timeout=self.http_timeout_seconds,
+            )
+        except requests.RequestException as e:
+            print_red(f"[work_client] Tent request failed or timed out: {e}")
+            return None, None, None
+
         if response.status_code == 204:
-            print("No tent image available yet.")
+            print_yellow("[work_client] No tent image available from cloud yet (204)")
         return self._parse_candidate_image(response)
     
     def get_mannequin_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification]]:
-        response = requests.get(self.cs_url + self.mannequin_img_endp)
+        try:
+            response = requests.get(
+                self.cs_url + self.mannequin_img_endp,
+                timeout=self.http_timeout_seconds,
+            )
+        except requests.RequestException as e:
+            print_red(f"[work_client] Mannequin request failed or timed out: {e}")
+            return None, None, None
+
         if response.status_code == 204:
-            print("No mannequin image available yet.")
+            print_yellow("[work_client] No mannequin image available from cloud yet (204)")
         return self._parse_candidate_image(response)
 
 
@@ -243,15 +277,24 @@ class WorkClient(object):
             "height": height,
             # 'targetId': targetId,
         }
-        print("DATA:", data)
+        print(
+            f"[work_client] Sending ADLC output to GS "
+            f"(assignment_id={assignment.get('id')}, label={label}, conf={number_conf:.3f}, "
+            f"center=({x_coord},{y_coord}), size=({width}x{height}))"
+        )
 
         response = requests.post(
             f"{self.gs_url}{self.adlc_endp}/{assignment['id']}",
             headers=self.auth_headers,
             json=data,
+            timeout=self.http_timeout_seconds,
         )
-        print(f"Response: {response.status_code}")
-        print(response.text)
+        if 200 <= response.status_code < 300:
+            print(f"[work_client] ADLC output accepted by GS (status={response.status_code})")
+        else:
+            print_red(f"[work_client] ADLC output rejected by GS (status={response.status_code})")
+            if response.text:
+                print_red(f"[work_client] GS response body: {response.text}")
         return response
 
 if __name__ == "__main__":

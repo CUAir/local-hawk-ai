@@ -31,10 +31,12 @@ class GDDetection:
         """
         Initialize the model
         """
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.model = load_model(
             os.path.join(script_dir, "../GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"),
-            os.path.join(script_dir, "../GroundingDINO/weights/groundingdino_swint_ogc.pth")
+            os.path.join(script_dir, "../GroundingDINO/weights/groundingdino_swint_ogc.pth"),
+            device=self.device,
         )
     
     def _load_image_b64(self, image_b64: str) -> Tuple[np.array, torch.Tensor]:
@@ -69,7 +71,7 @@ class GDDetection:
             caption=DINO_PROMPT,
             box_threshold=DINO_BOX_THRESH,
             text_threshold=DINO_TEXT_THRESH,
-            device="cuda" # TODO: change if using GPU
+            device=self.device,
         )
 
         # To save an image annotated with the bounding boxes
