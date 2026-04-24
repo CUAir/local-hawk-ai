@@ -340,12 +340,14 @@ def process_folder(
     extensions: Tuple[str, ...] = DEFAULT_EXTENSIONS,
     sort_by: str = "datetime",
     require_telemetry: bool = False,
+    min_altitude_m: Optional[float] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
     """Process images and return normalized CSV rows plus stats.
 
     When ``require_telemetry`` is True, rows whose altitude or yaw would be
     silently defaulted are dropped (counted under ``missing_altitude`` /
-    ``missing_yaw``).
+    ``missing_yaw``). When ``min_altitude_m`` is set, rows below that altitude
+    are dropped (counted under ``dropped_low_altitude``).
     """
     base = Path(folder_path)
     if not base.exists() or not base.is_dir():
@@ -362,6 +364,7 @@ def process_folder(
         "missing_yaw": 0,
         "fallback_altitude": 0,
         "fallback_yaw": 0,
+        "dropped_low_altitude": 0,
     }
     rows: List[Dict[str, object]] = []
 
@@ -389,6 +392,10 @@ def process_folder(
             stats["fallback_altitude"] += 1
         if _safe_float(telemetry.get("FlightYawDegree")) is None and _safe_float(telemetry.get("GimbalYawDegree")) is None:
             stats["fallback_yaw"] += 1
+
+        if min_altitude_m is not None and float(row["Altitude"]) < float(min_altitude_m):
+            stats["dropped_low_altitude"] += 1
+            continue
 
         rows.append(row)
 
@@ -490,11 +497,27 @@ def main() -> None:
         help="Reject rows whose altitude or heading would be silently defaulted to 0 "
              "(i.e. neither XMP, EXIF, nor sidecar JSON provided them).",
     )
+    parser.add_argument(
+        "--min-altitude",
+        type=float,
+        default=None,
+        help="Reject rows with altitude below this threshold (meters).",
+    )
+    parser.add_argument(
+        "--min-altitude-ft",
+        type=float,
+        default=None,
+        help="Same as --min-altitude but specified in feet. Overrides --min-altitude.",
+    )
     args = parser.parse_args()
 
     folder_path = args.image_folder
     output_file = args.output_csv if args.output_csv else f"{folder_path}.csv"
     extensions = _parse_extensions(args.extensions)
+
+    min_altitude_m = args.min_altitude
+    if args.min_altitude_ft is not None:
+        min_altitude_m = args.min_altitude_ft * 0.3048
 
     rows, stats = process_folder(
         folder_path=folder_path,
@@ -502,12 +525,13 @@ def main() -> None:
         extensions=extensions,
         sort_by=args.sort_by,
         require_telemetry=bool(args.require_telemetry),
+        min_altitude_m=min_altitude_m,
     )
 
     logger.info(
         "Telemetry summary: files=%d rows=%d xmp=%d exif=%d gs_json=%d "
         "missing_latlon=%d missing_altitude=%d missing_yaw=%d "
-        "fallback_altitude=%d fallback_yaw=%d",
+        "fallback_altitude=%d fallback_yaw=%d dropped_low_altitude=%d",
         stats["files_seen"],
         stats["rows_written"],
         stats["xmp_source"],
@@ -518,6 +542,7 @@ def main() -> None:
         stats["missing_yaw"],
         stats["fallback_altitude"],
         stats["fallback_yaw"],
+        stats["dropped_low_altitude"],
     )
 
     if args.strict and stats["missing_latlon"] > 0:
