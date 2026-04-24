@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import os
 import re
@@ -37,7 +38,7 @@ from stitcher import stitch_geolocated_images
 from dji_dataextraction import process_folder as dji_process_folder, write_metadata_to_csv
 
 REFERENCE_ALTITUDE = 100.0  # meters — altitude-normalization baseline
-MAX_INPUT_DIM_NO_ALT = 2000  # when altitude-based scaling is disabled, cap input dim
+CSV_MIN_ALTITUDE_FT = 75.0
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -63,40 +64,54 @@ def _read_csv(csv_path: str) -> Dict[str, Tuple[float, float, float, float]]:
     return metadata
 
 
-MIN_REASONABLE_ALTITUDE = 15.0  # meters; below this we assume telemetry is unreliable
-
-
-def _clamp_altitude_outliers(
+def _filter_valid_metadata(
     metadata: Dict[str, Tuple[float, float, float, float]],
-    tolerance: float = 0.40,
+    min_altitude_m: float,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Tuple[float, float, float, float]]:
-    """Clamp altitude outliers to median (preserve image coverage, fix scale).
-
-    If the median altitude is implausibly low (e.g. non-mapping GoPro telemetry
-    where `altitude` is barometric relative height near 0), fall back to a
-    disabled-scaling regime by zeroing all altitudes — :func:`_resize_image`
-    treats `altitude <= 0` as a no-op.
     """
-    alts = sorted(v[2] for v in metadata.values())
-    median_alt = alts[len(alts) // 2]
-    if median_alt < MIN_REASONABLE_ALTITUDE:
-        logging.getLogger(__name__).warning(
-            "Median altitude %.2fm below %.1fm threshold — disabling altitude-based scaling.",
-            median_alt, MIN_REASONABLE_ALTITUDE,
+    Keep only rows with finite telemetry and altitude above threshold.
+    """
+    kept: Dict[str, Tuple[float, float, float, float]] = {}
+    dropped_invalid = 0
+    dropped_low_alt = 0
+
+    for name, (lat, lon, alt, heading) in metadata.items():
+        if not (
+            np.isfinite(lat)
+            and np.isfinite(lon)
+            and np.isfinite(alt)
+            and np.isfinite(heading)
+        ):
+            dropped_invalid += 1
+            continue
+        if float(alt) < float(min_altitude_m):
+            dropped_low_alt += 1
+            continue
+        kept[name] = (lat, lon, alt, heading)
+
+    if logger is not None:
+        logger.info(
+            "Metadata validation: kept %d/%d rows (dropped %d invalid, %d below %.1fft)",
+            len(kept),
+            len(metadata),
+            dropped_invalid,
+            dropped_low_alt,
+            min_altitude_m / 0.3048,
         )
-        return {
-            img: (lat, lon, 0.0, heading)
-            for img, (lat, lon, _, heading) in metadata.items()
-        }
-    return {
-        img: (
-            lat,
-            lon,
-            median_alt if abs(alt - median_alt) / (median_alt + 1e-6) > tolerance else alt,
-            heading,
-        )
-        for img, (lat, lon, alt, heading) in metadata.items()
-    }
+    return kept
+
+
+def _default_csv_path(image_folder: Path) -> Path:
+    """Return a local-hawk-owned CSV cache path for this image folder."""
+    mapping_dir = Path(__file__).parent
+    csv_dir = mapping_dir / "generated_csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    pictureset = re.sub(r"[^a-z0-9]+", "-", image_folder.name.lower()).strip("-") or "images"
+    folder_key = hashlib.sha1(
+        str(image_folder.resolve()).encode("utf-8")
+    ).hexdigest()[:10]
+    return csv_dir / f"{pictureset}_{folder_key}.csv"
 
 
 def _rotate_image(image: np.ndarray, heading_deg: float) -> np.ndarray:
@@ -115,21 +130,12 @@ def _rotate_image(image: np.ndarray, heading_deg: float) -> np.ndarray:
 
 
 def _resize_image(image: np.ndarray, altitude: float) -> np.ndarray:
-    """Scale image proportional to altitude relative to REFERENCE_ALTITUDE.
-
-    When altitude is non-positive (scaling disabled), enforce a maximum input
-    dimension to keep memory in check for high-resolution cameras (e.g. GoPro
-    27MP frames * 75 images would otherwise exceed RAM).
-    """
-    if altitude <= 0:
-        h, w = image.shape[:2]
-        max_dim = max(h, w)
-        if max_dim > MAX_INPUT_DIM_NO_ALT:
-            factor = MAX_INPUT_DIM_NO_ALT / float(max_dim)
-            return cv2.resize(image, None, fx=factor, fy=factor,
-                              interpolation=cv2.INTER_AREA)
+    """Scale image based on altitude relative to REFERENCE_ALTITUDE."""
+    if altitude is None or not np.isfinite(altitude) or altitude <= 0:
         return image
     factor = altitude / REFERENCE_ALTITUDE
+    if factor <= 0:
+        return image
     return cv2.resize(image, None, fx=factor, fy=factor)
 
 
@@ -189,59 +195,70 @@ class GpsSiftPipeline:
 
         # --- Resolve / auto-generate CSV ---
         if csv_path is None:
-            csv_path = str(folder.with_suffix(".csv"))
+            csv_path = str(_default_csv_path(folder))
         if not Path(csv_path).exists():
+            csv_min_altitude_m = max(
+                self.min_altitude if self.min_altitude is not None else 0.0,
+                CSV_MIN_ALTITUDE_FT * 0.3048,
+            )
             self.logger.info("CSV not found at %s — extracting from DJI metadata...", csv_path)
             rows, stats = dji_process_folder(
-                str(folder), require_telemetry=self.require_telemetry
+                str(folder),
+                require_telemetry=self.require_telemetry,
+                min_altitude_m=csv_min_altitude_m,
             )
             if not rows:
                 raise RuntimeError("No telemetry found in image XMP/EXIF metadata")
             write_metadata_to_csv(rows, csv_path)
             self.logger.info(
-                "Extracted %d rows → %s  (skipped: %d missing lat/lon, %d missing altitude, %d missing yaw)",
+                "Extracted %d rows → %s  (skipped: %d missing lat/lon, %d missing altitude, %d missing yaw, %d below %.1fft)",
                 stats["rows_written"],
                 csv_path,
                 stats.get("missing_latlon", 0),
                 stats.get("missing_altitude", 0),
                 stats.get("missing_yaw", 0),
+                stats.get("dropped_low_altitude", 0),
+                CSV_MIN_ALTITUDE_FT,
             )
+
+        enforced_min_altitude_m = max(
+            self.min_altitude if self.min_altitude is not None else 0.0,
+            CSV_MIN_ALTITUDE_FT * 0.3048,
+        )
 
         # --- Load metadata ---
         metadata = _read_csv(csv_path)
         if not metadata:
             raise ValueError(f"No entries found in CSV: {csv_path}")
 
-        # Drop images captured below a minimum altitude (e.g. takeoff/landing frames).
-        if self.min_altitude is not None:
-            before = len(metadata)
-            metadata = {
-                name: row for name, row in metadata.items()
-                if row[2] >= self.min_altitude
-            }
-            dropped = before - len(metadata)
-            if not metadata:
-                raise ValueError(
-                    f"No images with altitude >= {self.min_altitude:.1f}m "
-                    f"(all {before} rejected)."
-                )
-            self.logger.info(
-                "Altitude filter: kept %d/%d images (>= %.1fm, dropped %d)",
-                len(metadata), before, self.min_altitude, dropped,
+        metadata = _filter_valid_metadata(
+            metadata,
+            min_altitude_m=enforced_min_altitude_m,
+            logger=self.logger,
+        )
+        if not metadata:
+            raise ValueError(
+                "No CSV rows remain after metadata/altitude validation "
+                f"(required altitude >= {CSV_MIN_ALTITUDE_FT:.1f}ft)."
             )
 
-        metadata = _clamp_altitude_outliers(metadata)
         self.logger.info("Loaded metadata for %d images", len(metadata))
 
         # --- Load and pre-process images ---
-        # Iterate in CSV row order (temporal capture order) so the stitcher's
-        # anchor image (index 0) matches the first-captured image, consistent
-        # with with_stitch_main.py behaviour on macOS (os.listdir ≈ creation order).
+        # Keep with_stitch_main ordering behavior: iterate files discovered from
+        # the image folder and keep only those present in metadata.
         images: List[np.ndarray] = []
         coordinates: List[Tuple[float, float]] = []
         skipped = 0
 
-        for name in metadata:  # dict preserves CSV insertion order (Python 3.7+)
+        image_files = [
+            f for f in os.listdir(folder)
+            if Path(f).suffix.lower() in self.IMAGE_EXTENSIONS
+        ]
+        for name in image_files:
+            if name not in metadata:
+                skipped += 1
+                continue
             path = folder / name
             if not path.exists():
                 skipped += 1
@@ -308,7 +325,7 @@ def main() -> None:
     parser.add_argument(
         "--csv",
         default=None,
-        help="Metadata CSV path (default: <image_folder>.csv; auto-extracted if absent)",
+        help="Metadata CSV path (default: local-hawk-ai/mapping/generated_csv/<pictureset>_<hash>.csv; auto-extracted if absent)",
     )
     parser.add_argument(
         "--output",
