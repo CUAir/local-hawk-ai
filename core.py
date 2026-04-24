@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer
-from communication.intsys_gs_api import MapCommandHandler
+from communication.intsys_gs_api import MapCommandHandler, ResultStore
 import requests
 import io
 import base64
@@ -187,13 +187,14 @@ class Mapper:
         self.trigger_pipeline()
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper, result_interval_seconds: float = 10.0):
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, result_interval_seconds: float = 10.0):
         header("\n[vision] Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
         # self.target_attr = self.work_client.get_target_attributes()
         header("[vision] Initializing Mapper")
         self.mapper = mapper
+        self.result_store = result_store
         self.result_interval_seconds = max(1.0, float(result_interval_seconds))
         self._send_lock = threading.Lock()
         self._result_scheduler_thread = threading.Thread(
@@ -207,25 +208,26 @@ class VisionClient:
         self._gd_best_tent: tuple = None        # (assignment, ROI, Classification)
 
     def _result_scheduler_loop(self):
-        while True:
-            remaining = int(self.result_interval_seconds)
-            while remaining > 0:
-                # Log every 5 seconds, then every second in the last 5 seconds.
-                if remaining <= 5 or remaining % 5 == 0:
-                    print(f"[scheduler] Next GS send in {remaining}s")
-                time.sleep(1)
-                remaining -= 1
+        print("TODO: bring this back")
+        # while True:
+        #     remaining = int(self.result_interval_seconds)
+        #     while remaining > 0:
+        #         # Log every 5 seconds, then every second in the last 5 seconds.
+        #         if remaining <= 5 or remaining % 5 == 0:
+        #             print(f"[scheduler] Next GS send in {remaining}s")
+        #         time.sleep(1)
+        #         remaining -= 1
 
-            if not self._send_lock.acquire(blocking=False):
-                print_yellow("[scheduler] send_result() already running; skipping this tick")
-                continue
-            try:
-                print_green("\n[scheduler] Sending current results to GS")
-                self.send_result()
-            except Exception as e:
-                print_red(f"[scheduler] send_result() failed: {e}")
-            finally:
-                self._send_lock.release()
+        #     if not self._send_lock.acquire(blocking=False):
+        #         print_yellow("[scheduler] send_result() already running; skipping this tick")
+        #         continue
+        #     try:
+        #         print_green("\n[scheduler] Sending current results to GS")
+        #         self.send_result()
+        #     except Exception as e:
+        #         print_red(f"[scheduler] send_result() failed: {e}")
+        #     finally:
+        #         self._send_lock.release()
 
     def run_task(self):
         print("\n[worker] Starting task cycle ========")
@@ -356,16 +358,16 @@ class VisionClient:
             except Exception as e:
                 print_red(f"[send_result] Exception while sending {target_name} using {source} image: {e}")
 
-        print("[send_result] Getting MANNEQUIN image")
-        m_assignment, m_roi, m_classification = self.work_client.get_mannequin_image()
-        print("[send_result] Getting TENT image")
-        t_assignment, t_roi, t_classification = self.work_client.get_tent_image()
-        
+        # Cloud-pushed results (via POST /api/result)
+        cloud_mannequin = self.result_store.get_mannequin()
+        cloud_tent = self.result_store.get_tent()
 
-        # Mannequin: prefer cloud server result; fall back to GD backup on 204
-        if m_assignment is not None and m_roi is not None and m_classification is not None:
-            print_green("[send_result] mannequin source = server")
-            _send_with_log("mannequin", m_assignment, m_roi, m_classification, "server")
+        # Mannequin: prefer cloud-pushed result; fall back to GD backup
+        if cloud_mannequin is not None:
+            m_assignment, m_roi, m_classification, m_model_source, m_gemini_reason = cloud_mannequin
+            reason_str = f", gemini={m_gemini_reason!r}" if m_gemini_reason else ""
+            print(f"[send_result] mannequin source = cloud push (model={m_model_source}{reason_str})")
+            _send_with_log("mannequin", m_assignment, m_roi, m_classification, "cloud")
         elif self._gd_best_mannequin is not None:
             print_yellow("[send_result] mannequin source = cached (GD backup)")
             gd_assign, gd_roi, gd_clf = self._gd_best_mannequin
@@ -373,10 +375,12 @@ class VisionClient:
         else:
             print_red("[send_result] No mannequin candidate available to send")
 
-        # Tent: prefer cloud server result; fall back to GD backup on 204
-        if t_assignment is not None and t_roi is not None and t_classification is not None:
-            print_green("[send_result] tent source = server")
-            _send_with_log("tent", t_assignment, t_roi, t_classification, "server")
+        # Tent: prefer cloud-pushed result; fall back to GD backup
+        if cloud_tent is not None:
+            t_assignment, t_roi, t_classification, t_model_source, t_gemini_reason = cloud_tent
+            reason_str = f", gemini={t_gemini_reason!r}" if t_gemini_reason else ""
+            print(f"[send_result] tent source = cloud push (model={t_model_source}{reason_str})")
+            _send_with_log("tent", t_assignment, t_roi, t_classification, "cloud")
         elif self._gd_best_tent is not None:
             print_yellow("[send_result] tent source = cached (GD backup)")
             gd_assign, gd_roi, gd_clf = self._gd_best_tent
@@ -384,11 +388,12 @@ class VisionClient:
         else:
             print_red("[send_result] No tent candidate available to send")
         print("[send_result] DONE SENDING RESULTS ========= ")
-def start_mapping_server(mapper: Mapper, port=8000):
+def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8000):
     header(f"\n[mapping] Map HTTP server started on port {port}")
 
-    # Set the mapper in the handler class
+    # Set the mapper and result_store in the handler class
     MapCommandHandler.mapper = mapper
+    MapCommandHandler.result_store = result_store
 
     # Create and start the HTTP server
     server = HTTPServer(('0.0.0.0', port), MapCommandHandler)
@@ -398,9 +403,9 @@ def start_mapping_server(mapper: Mapper, port=8000):
     except Exception as e:
         print_red(f"Error in map HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper, result_interval_seconds: float = 10.0):
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, result_interval_seconds: float = 10.0):
     header("\n[worker] Starting worker loop")
-    worker = VisionClient(work_client, mapper, result_interval_seconds)
+    worker = VisionClient(work_client, mapper, result_store, result_interval_seconds)
     while True:
         try:
             worker.run_task()
@@ -431,16 +436,17 @@ def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, re
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
     mapper = Mapper(work_client)
+    result_store = ResultStore()
 
     # Initialize mapping session directory (wipes stale data, creates clean dirs)
     _reset_session()
 
     # Start mapping HTTP server in background daemon thread
-    threading.Thread(target=start_mapping_server, args=(mapper, map_server_port), daemon=True).start()
+    threading.Thread(target=start_mapping_server, args=(mapper, result_store, map_server_port), daemon=True).start()
     threading.Thread(target=idle_mapping_monitor_loop, args=(mapper, map_idle_timeout), daemon=True).start()
 
     # TODO: implement MP, not doing it right now to see errors clearly
-    worker_loop(work_client, mapper, result_interval_seconds)
+    worker_loop(work_client, mapper, result_store, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
