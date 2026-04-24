@@ -273,10 +273,52 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     with open(mfpath, 'r') as _mf:
                                         try:
                                             _m = _json.load(_mf)
-                                            cloud_mannequin['full_image'] = _m.get('full_image')
-                                            cloud_mannequin['roi_image'] = _m.get('roi_image')
+                                        except Exception:
+                                            _m = {}
+                                    # Determine expected filenames
+                                    full_fname = _m.get('full_image')
+                                    roi_fname = _m.get('roi_image')
+                                    full_path = EXPORT_DIR / full_fname if full_fname else None
+                                    roi_path = EXPORT_DIR / roi_fname if roi_fname else None
+
+                                    # If full image file is missing, try to fetch from imaging GS
+                                    if full_fname and (not full_path.exists()):
+                                        try:
+                                            assignment = cloud_mannequin.get('assignment') or {}
+                                            img_endpoint = None
+                                            if isinstance(assignment, dict):
+                                                img_endpoint = (assignment.get('image') or {}).get('imageUrl') or (assignment.get('image') or {}).get('localImageUrl')
+                                            if img_endpoint and hasattr(self, 'mapper') and getattr(self.mapper, 'work_client', None):
+                                                try:
+                                                    fetched = self.mapper.work_client.get_image(img_endpoint)
+                                                    if fetched is not None:
+                                                        try:
+                                                            fetched.save(str(full_path), format='JPEG')
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             pass
+
+                                    # If roi image file is missing but full is present, create roi crop
+                                    if roi_fname and (not roi_path.exists()) and full_fname and (EXPORT_DIR / full_fname).exists():
+                                        try:
+                                            from PIL import Image as _PILImage
+                                            _full = _PILImage.open(str(EXPORT_DIR / full_fname)).convert('RGB')
+                                            bbox = _m.get('bbox') or []
+                                            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                                                x1, y1, x2, y2 = [int(v) for v in bbox]
+                                                crop = _full.crop((x1, y1, x2, y2))
+                                                try:
+                                                    crop.save(str(roi_path), format='JPEG')
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
+
+                                    cloud_mannequin['full_image'] = full_fname if full_fname else None
+                                    cloud_mannequin['roi_image'] = roi_fname if roi_fname else None
                         except Exception:
                             pass
                 except Exception:
@@ -306,10 +348,49 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     with open(mfpath, 'r') as _mf:
                                         try:
                                             _m = _json.load(_mf)
-                                            cloud_tent['full_image'] = _m.get('full_image')
-                                            cloud_tent['roi_image'] = _m.get('roi_image')
+                                        except Exception:
+                                            _m = {}
+                                    full_fname = _m.get('full_image')
+                                    roi_fname = _m.get('roi_image')
+                                    full_path = EXPORT_DIR / full_fname if full_fname else None
+                                    roi_path = EXPORT_DIR / roi_fname if roi_fname else None
+
+                                    if full_fname and (not full_path.exists()):
+                                        try:
+                                            assignment = cloud_tent.get('assignment') or {}
+                                            img_endpoint = None
+                                            if isinstance(assignment, dict):
+                                                img_endpoint = (assignment.get('image') or {}).get('imageUrl') or (assignment.get('image') or {}).get('localImageUrl')
+                                            if img_endpoint and hasattr(self, 'mapper') and getattr(self.mapper, 'work_client', None):
+                                                try:
+                                                    fetched = self.mapper.work_client.get_image(img_endpoint)
+                                                    if fetched is not None:
+                                                        try:
+                                                            fetched.save(str(full_path), format='JPEG')
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             pass
+
+                                    if roi_fname and (not roi_path.exists()) and full_fname and (EXPORT_DIR / full_fname).exists():
+                                        try:
+                                            from PIL import Image as _PILImage
+                                            _full = _PILImage.open(str(EXPORT_DIR / full_fname)).convert('RGB')
+                                            bbox = _m.get('bbox') or []
+                                            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                                                x1, y1, x2, y2 = [int(v) for v in bbox]
+                                                crop = _full.crop((x1, y1, x2, y2))
+                                                try:
+                                                    crop.save(str(roi_path), format='JPEG')
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
+
+                                    cloud_tent['full_image'] = full_fname if full_fname else None
+                                    cloud_tent['roi_image'] = roi_fname if roi_fname else None
                         except Exception:
                             pass
                 except Exception:
