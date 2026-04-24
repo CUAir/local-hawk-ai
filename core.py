@@ -8,17 +8,19 @@ from constructs.roi import ROI
 import argparse
 import PIL.Image as Image
 from multiprocessing import Process
+import socket
 import os
 import csv
 import shutil
 import threading
 from pathlib import Path
 from datetime import datetime
-from http.server import HTTPServer
-from communication.intsys_gs_api import MapCommandHandler, ResultStore
+from http.server import ThreadingHTTPServer
+from communication.intsys_gs_api import MapCommandHandler, ResultStore, EXPORT_DIR, notify_sse
 import requests
 import io
 import base64
+import json
 from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
@@ -203,6 +205,13 @@ class VisionClient:
         )
         self._result_scheduler_thread.start()
 
+        # Background thread: poll cloud server for best images and update result_store
+        self._cloud_poller_thread = threading.Thread(
+            target=self._cloud_poller_loop,
+            daemon=True,
+        )
+        self._cloud_poller_thread.start()
+
         # GD backup: best detected candidate per label from the most recent image
         self._gd_best_mannequin: tuple = None  # (assignment, ROI, Classification)
         self._gd_best_tent: tuple = None        # (assignment, ROI, Classification)
@@ -228,6 +237,113 @@ class VisionClient:
         #         print_red(f"[scheduler] send_result() failed: {e}")
         #     finally:
         #         self._send_lock.release()
+
+    def _cloud_poller_loop(self):
+        """Poll the cloud server for best tent/mannequin images and update result_store.
+
+        When the server returns a best image, update `result_store` so it will be
+        preferred over any cached GD backup. If the server returns nothing (204),
+        leave the existing store entries untouched so GD backup can be used.
+        """
+        while True:
+            try:
+                # Mannequin
+                try:
+                    assign, roi, clf = self.work_client.get_mannequin_image()
+                    if assign is not None and roi is not None and clf is not None:
+                        try:
+                            # Persist ROI (and a surrogate full image) and write metadata
+                            try:
+                                ts = int(time.time() * 1000)
+                                label_name = 'mannequin'
+                                aid = assign.get('id') if assign else 'noid'
+                                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                                # Save ROI crop as both roi and full (no full image available)
+                                try:
+                                    roi.roi.save(str(full_fn), format='JPEG')
+                                except Exception:
+                                    pass
+                                try:
+                                    roi.roi.save(str(roi_fn), format='JPEG')
+                                except Exception:
+                                    pass
+                                meta = {
+                                    "timestamp": ts,
+                                    "label": label_name,
+                                    "assignment_id": aid,
+                                    "assignment": assign,
+                                    "model_source": "cloud_pull",
+                                    "gemini_reason": None,
+                                    "score": float(clf.label[1]) if clf is not None else 0.0,
+                                    "full_image": str(full_fn.name),
+                                    "roi_image": str(roi_fn.name),
+                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
+                                    "pushed": True,
+                                }
+                                meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                                with open(meta_fn, 'w') as mf:
+                                    json.dump(meta, mf)
+                                mf_name = meta_fn.name
+                            except Exception:
+                                mf_name = None
+
+                            self.result_store.update(LabelType.MANNEQUIN, assign, roi, clf, "cloud_pull", None, mf_name)
+                            print_green("[poller] Updated mannequin from cloud pull")
+                        except Exception as e:
+                            print_red(f"[poller] Failed to update mannequin result_store: {e}")
+                except Exception as e:
+                    print_yellow(f"[poller] Mannequin pull error: {e}")
+
+                # Tent
+                try:
+                    assign, roi, clf = self.work_client.get_tent_image()
+                    if assign is not None and roi is not None and clf is not None:
+                        try:
+                            # Persist ROI/full surrogate and write metadata
+                            try:
+                                ts = int(time.time() * 1000)
+                                label_name = 'tent'
+                                aid = assign.get('id') if assign else 'noid'
+                                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                                try:
+                                    roi.roi.save(str(full_fn), format='JPEG')
+                                except Exception:
+                                    pass
+                                try:
+                                    roi.roi.save(str(roi_fn), format='JPEG')
+                                except Exception:
+                                    pass
+                                meta = {
+                                    "timestamp": ts,
+                                    "label": label_name,
+                                    "assignment_id": aid,
+                                    "assignment": assign,
+                                    "model_source": "cloud_pull",
+                                    "gemini_reason": None,
+                                    "score": float(clf.label[1]) if clf is not None else 0.0,
+                                    "full_image": str(full_fn.name),
+                                    "roi_image": str(roi_fn.name),
+                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
+                                    "pushed": True,
+                                }
+                                meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                                with open(meta_fn, 'w') as mf:
+                                    json.dump(meta, mf)
+                                mf_name = meta_fn.name
+                            except Exception:
+                                mf_name = None
+
+                            self.result_store.update(LabelType.TENT, assign, roi, clf, "cloud_pull", None, mf_name)
+                            print_green("[poller] Updated tent from cloud pull")
+                        except Exception as e:
+                            print_red(f"[poller] Failed to update tent result_store: {e}")
+                except Exception as e:
+                    print_yellow(f"[poller] Tent pull error: {e}")
+            except Exception as e:
+                print_yellow(f"[poller] Unexpected polling error: {e}")
+            time.sleep(self.result_interval_seconds)
 
     def run_task(self):
         print("\n[worker] Starting task cycle ========")
@@ -256,6 +372,41 @@ class VisionClient:
             break
         self.image = image
         self.mapper.mark_image_received()
+
+        # Export the raw ground-station pull (no processing yet) to EXPORT_DIR
+        try:
+            ts = int(time.time() * 1000)
+            aid = self.assignment.get('id') if self.assignment else 'noid'
+            full_fn = EXPORT_DIR / f"full_gs_{aid}_{ts}.jpg"
+            try:
+                self.image.save(str(full_fn), format="JPEG")
+            except Exception:
+                pass
+
+            # Minimal metadata: timestamp and assignment only (no processing fields)
+            try:
+                meta = {
+                    "timestamp": ts,
+                    "assignment_id": aid,
+                    "assignment": self.assignment,
+                    "model_source": "gs_pull",
+                    "full_image": str(full_fn.name),
+                    # indicate this is a raw GS pull
+                    "pushed": False,
+                }
+                meta_fn = EXPORT_DIR / f"meta_gs_{aid}_{ts}.json"
+                import json as _json
+                with open(meta_fn, 'w') as mf:
+                    _json.dump(meta, mf)
+                # Notify frontend via SSE that a new GS pull arrived
+                try:
+                    notify_sse('gs_pull', { 'meta': meta_fn.name, 'timestamp': ts })
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # Add image to mapping folder
         # self.mapper.add_image(image, metadata)
@@ -331,6 +482,46 @@ class VisionClient:
             roi, clf = _candidate_to_roi_classification(best_mannequin, LabelType.MANNEQUIN)
             self._gd_best_mannequin = (self.assignment, roi, clf)
             print(f"[gd_backup] Cached mannequin candidate (score={best_mannequin.score:.3f})")
+            # Export cached GD backup to disk for inspection / frontend
+            try:
+                ts = int(time.time() * 1000)
+                label_name = "mannequin"
+                aid = self.assignment.get('id') if self.assignment else 'noid'
+                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                # Save full image and roi crop
+                try:
+                    self.image.save(str(full_fn), format="JPEG")
+                except Exception:
+                    pass
+                try:
+                    roi.roi.save(str(roi_fn), format="JPEG")
+                except Exception:
+                    pass
+                # Write metadata sidecar JSON
+                try:
+                    meta = {
+                        "timestamp": ts,
+                        "label": label_name,
+                        "assignment_id": aid,
+                        "assignment": self.assignment,
+                        "model_source": "gd_backup",
+                        "gemini_reason": None,
+                        "score": float(best_mannequin.score),
+                        "full_image": str(full_fn.name),
+                        "roi_image": str(roi_fn.name),
+                        "bbox": list(roi.top_left) + list(roi.bottom_right),
+                            # Mark that this is a GD backup candidate (not a cloud push)
+                            "pushed": False,
+                    }
+                    meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                    with open(meta_fn, "w") as mf:
+                        import json
+                        json.dump(meta, mf)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         else:
             print_yellow("[gd_backup] No mannequin candidate found in current image")
 
@@ -338,6 +529,44 @@ class VisionClient:
             roi, clf = _candidate_to_roi_classification(best_tent, LabelType.TENT)
             self._gd_best_tent = (self.assignment, roi, clf)
             print(f"[gd_backup] Cached tent candidate (score={best_tent.score:.3f})")
+            # Export cached GD backup to disk for inspection / frontend
+            try:
+                ts = int(time.time() * 1000)
+                label_name = "tent"
+                aid = self.assignment.get('id') if self.assignment else 'noid'
+                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                try:
+                    self.image.save(str(full_fn), format="JPEG")
+                except Exception:
+                    pass
+                try:
+                    roi.roi.save(str(roi_fn), format="JPEG")
+                except Exception:
+                    pass
+                try:
+                    meta = {
+                        "timestamp": ts,
+                        "label": label_name,
+                        "assignment_id": aid,
+                            "assignment": self.assignment,
+                        "model_source": "gd_backup",
+                        "gemini_reason": None,
+                        "score": float(best_tent.score),
+                        "full_image": str(full_fn.name),
+                        "roi_image": str(roi_fn.name),
+                        "bbox": list(roi.top_left) + list(roi.bottom_right),
+                        # Mark that this is a GD backup candidate (not a cloud push)
+                        "pushed": False,
+                    }
+                    meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                    with open(meta_fn, "w") as mf:
+                        import json
+                        json.dump(meta, mf)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         else:
             print_yellow("[gd_backup] No tent candidate found in current image")
 
@@ -364,7 +593,8 @@ class VisionClient:
 
         # Mannequin: prefer cloud-pushed result; fall back to GD backup
         if cloud_mannequin is not None:
-            m_assignment, m_roi, m_classification, m_model_source, m_gemini_reason = cloud_mannequin
+            # tuple: (assignment, roi, classification, model_source, gemini_reason, meta_filename_opt)
+            m_assignment, m_roi, m_classification, m_model_source, m_gemini_reason, _ = cloud_mannequin
             reason_str = f", gemini={m_gemini_reason!r}" if m_gemini_reason else ""
             print(f"[send_result] mannequin source = cloud push (model={m_model_source}{reason_str})")
             _send_with_log("mannequin", m_assignment, m_roi, m_classification, "cloud")
@@ -377,7 +607,8 @@ class VisionClient:
 
         # Tent: prefer cloud-pushed result; fall back to GD backup
         if cloud_tent is not None:
-            t_assignment, t_roi, t_classification, t_model_source, t_gemini_reason = cloud_tent
+            # tuple: (assignment, roi, classification, model_source, gemini_reason, meta_filename_opt)
+            t_assignment, t_roi, t_classification, t_model_source, t_gemini_reason, _ = cloud_tent
             reason_str = f", gemini={t_gemini_reason!r}" if t_gemini_reason else ""
             print(f"[send_result] tent source = cloud push (model={t_model_source}{reason_str})")
             _send_with_log("tent", t_assignment, t_roi, t_classification, "cloud")
@@ -388,7 +619,7 @@ class VisionClient:
         else:
             print_red("[send_result] No tent candidate available to send")
         print("[send_result] DONE SENDING RESULTS ========= ")
-def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8000):
+def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
     header(f"\n[mapping] Map HTTP server started on port {port}")
 
     # Set the mapper and result_store in the handler class
@@ -396,7 +627,7 @@ def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8000):
     MapCommandHandler.result_store = result_store
 
     # Create and start the HTTP server
-    server = HTTPServer(('0.0.0.0', port), MapCommandHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), MapCommandHandler)
 
     try:
         server.serve_forever()
@@ -428,7 +659,7 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
             print_yellow(f"[mapping] Idle monitor error: {e}")
         time.sleep(IDLE_MAPPING_POLL_SECONDS)
 
-def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, result_interval_seconds: float = 10.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS):
+def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8080, result_interval_seconds: float = 10.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS):
     header(
         f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
         f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s"
@@ -441,11 +672,28 @@ def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8000, re
     # Initialize mapping session directory (wipes stale data, creates clean dirs)
     _reset_session()
 
-    # Start mapping HTTP server in background daemon thread
+    # Start mapping HTTP server in a background thread so it runs concurrently
     threading.Thread(target=start_mapping_server, args=(mapper, result_store, map_server_port), daemon=True).start()
+
+    # Idle mapping monitor can run in a background thread
     threading.Thread(target=idle_mapping_monitor_loop, args=(mapper, map_idle_timeout), daemon=True).start()
 
-    # TODO: implement MP, not doing it right now to see errors clearly
+    # Wait until the server has bound the port (or timeout)
+    def _wait_for_port(host: str, port: int, timeout: float = 3.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    return True
+            except Exception:
+                time.sleep(0.05)
+        return False
+
+    bound = _wait_for_port('127.0.0.1', map_server_port, timeout=3.0)
+    if not bound:
+        print_red(f"[startup] Warning: mapping server did not bind port {map_server_port} within timeout")
+
+    # Run workers in the main process concurrently with the server thread
     worker_loop(work_client, mapper, result_store, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
@@ -470,8 +718,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
     parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
-    parser.add_argument('--csip', type=str, default="34.106.113.118:8000", help="Specify cloud server custom IP address")
-    parser.add_argument('--map-port', type=int, default=8000, help="Port for the map command HTTP server")
+    parser.add_argument('--csip', type=str, default="34.106.160.143:8000", help="Specify cloud server custom IP address")
+    parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=20.0, help="Run send_result() every F seconds")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")

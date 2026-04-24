@@ -1,0 +1,257 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Hawk AI - Results</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .container { display:flex; gap:24px; }
+    .column { flex:1; min-width:300px; }
+    .card { border:1px solid #ddd; padding:12px; border-radius:6px; margin-bottom:12px; background:#fff }
+    .card.highlight { border:3px solid #2aa02a; box-shadow:0 0 8px rgba(42,160,42,0.12) }
+    .thumb { width:100%; height:auto; border:1px solid #ccc; display:block }
+    .meta { margin-top:8px; font-size:14px; }
+    .label { font-weight:600; margin-bottom:8px }
+    .empty { color:#888; }
+    .timestamp { color:#666; font-size:12px }
+    .log { max-height: 80vh; overflow:auto; padding-right:8px }
+    .bbox { position:relative }
+    canvas.entry-canvas { width:100%; height:auto; display:block }
+    .gs-column { flex: 0 0 360px; }
+    .gs-card { border:1px solid #ddd; padding:12px; border-radius:6px; background:#fafafa }
+    .assignment { margin-top:8px; }
+    .assignment pre { font-size:12px; line-height:1.2; max-height:6em; overflow:auto; margin:6px 0 0 0; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Local Hawk AI — Latest Results</h1>
+  <p>Shows the most recent saved result for each label (tent, mannequin). Images may come from cloud push or local GD backup.</p>
+  <div class="container">
+    <div class="column">
+      <div class="label">Tent</div>
+      <div class="log" id="log-tent"></div>
+    </div>
+    <div class="column">
+        <div class="label">Mannequin</div>
+        <div class="log" id="log-mannequin"></div>
+    </div>
+    <div class="column gs-column">
+      <div class="label">Latest GS Pull</div>
+      <div id="gs-panel"></div>
+    </div>
+  </div>
+
+<script>
+async function fetchBest() {
+  try {
+    const res = await fetch('/api/best');
+    if (!res.ok) throw new Error('failed');
+    return await res.json();
+  } catch (e) { console.error(e); return null; }
+}
+  function fmtTs(ts) {
+    if (!ts) return 'N/A';
+    const d = new Date(ts);
+    return d.toLocaleString();
+  }
+
+  function createEntryCard(label, data, metaFilename, isBest) {
+    const card = document.createElement('div');
+    card.className = 'card' + (isBest ? ' highlight' : '');
+    const ts = data.timestamp;
+    const header = document.createElement('div');
+    header.innerHTML = `<div class="timestamp">${fmtTs(ts)}</div>`;
+    card.appendChild(header);
+
+    const imgSrc = '/export/' + (data.full_image || '');
+    const canvas = document.createElement('canvas');
+    canvas.className = 'entry-canvas';
+    canvas.width = 640; canvas.height = 360;
+    card.appendChild(canvas);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    let html = '';
+    html += '<div><strong>ID:</strong> ' + (data.assignment_id || 'N/A') + '</div>';
+    html += '<div><strong>Score:</strong> ' + (data.score !== undefined ? data.score.toFixed(3) : 'N/A') + '</div>';
+    html += '<div><strong>Source:</strong> ' + (data.model_source || 'unknown') + '</div>';
+    if (data.gemini_reason) html += '<div><strong>Gemini:</strong> ' + data.gemini_reason + '</div>';
+    // Assignment / location details (if available)
+    try {
+      const a = data.assignment || null;
+      if (a) {
+        if (a.telemetry) {
+          const t = a.telemetry;
+          html += '<div style="margin-top:8px"><strong>Location:</strong>' +
+                  '<div>Lat: ' + (t.latitude !== undefined ? t.latitude : 'N/A') + ', Lon: ' + (t.longitude !== undefined ? t.longitude : 'N/A') + '</div>' +
+                  '<div>Alt: ' + (t.altitude !== undefined ? t.altitude : 'N/A') + ', Yaw: ' + (t.yaw !== undefined ? t.yaw : 'N/A') + '</div>' +
+                  '</div>';
+        } else {
+          html += '<div class="assignment"><strong>Assignment:</strong><pre>' + JSON.stringify(a, null, 2) + '</pre></div>';
+        }
+      }
+    } catch (e) {}
+    meta.innerHTML = html;
+    card.appendChild(meta);
+
+    // Load image and draw bbox
+    const img = new Image();
+    img.onload = () => {
+      const ctx = canvas.getContext('2d');
+      const ratio = img.naturalWidth / img.naturalHeight;
+      const w = Math.min(800, img.naturalWidth);
+      const h = Math.round(w / ratio);
+      canvas.width = w; canvas.height = h;
+      ctx.drawImage(img, 0, 0, w, h);
+      if (data.bbox && data.bbox.length === 4) {
+        const [x1,y1,x2,y2] = data.bbox;
+        const scaleX = w / img.naturalWidth;
+        const scaleY = h / img.naturalHeight;
+        ctx.strokeStyle = 'red'; ctx.lineWidth = 2;
+        ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
+      }
+    };
+    img.onerror = () => {
+      canvas.getContext('2d').fillStyle = '#f3f3f3';
+      canvas.getContext('2d').fillRect(0,0,canvas.width,canvas.height);
+      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#888'; ctx.fillText('Image load failed', 10, 20);
+    };
+    img.src = imgSrc;
+
+    return card;
+  }
+
+  async function refresh() {
+    const best = await fetchBest();
+    if (!best) return;
+    const tentLog = document.getElementById('log-tent');
+    const manLog = document.getElementById('log-mannequin');
+    tentLog.innerHTML = '';
+    manLog.innerHTML = '';
+
+    const tentList = best.tent || [];
+    const manList = best.mannequin || [];
+
+    // Use explicit to_send fields only (guaranteed to match send_result logic)
+    const currentBestTent = best.to_send_tent_meta || null;
+    const currentBestMan = best.to_send_mannequin_meta || null;
+
+    // Cloud-pulled bests (in-memory result_store entries)
+    const cloudTent = best.cloud_tent || null;
+    const cloudMan = best.cloud_mannequin || null;
+
+    function appendFiltered(list, container, labelName, currentBestMeta) {
+      const filtered = list.filter(e => (e.pushed === true) || (e.model_source === 'gd_backup'));
+
+      // Find the exact meta that's being sent (if present in the full list)
+      let bestInList = null;
+      if (currentBestMeta) {
+        bestInList = list.find(e => (e._meta_filename || null) === currentBestMeta) || null;
+      }
+
+        // If a cloud-pulled best exists for this label, render it first (it overrides GD backup)
+        let cloudBest = null;
+        if (labelName === 'tent' && cloudTent) cloudBest = cloudTent;
+        if (labelName === 'mannequin' && cloudMan) cloudBest = cloudMan;
+        if (cloudBest) {
+          // Render a special cloud card (no exported image available)
+          const cloudData = {
+            timestamp: Date.now(),
+            assignment_id: (cloudBest.assignment && cloudBest.assignment.id) || null,
+            assignment: cloudBest.assignment || null,
+            score: cloudBest.score || null,
+            model_source: cloudBest.model_source || 'cloud',
+            gemini_reason: cloudBest.gemini_reason || null,
+            bbox: cloudBest.bbox || null,
+            full_image: null,
+          };
+          const cloudCard = createEntryCard(labelName + ' (cloud)', cloudData, cloudBest._meta_filename || null, true);
+          container.appendChild(cloudCard);
+        }
+
+      if (filtered.length === 0 && !bestInList) {
+        container.innerHTML = '<div class="card empty">No ' + labelName + ' images to show</div>';
+        return;
+      }
+
+      // If we have a best meta, render it first (pinned to top) and remove it from the remainder
+      if (bestInList) {
+        const idx = filtered.findIndex(e => (e._meta_filename || null) === currentBestMeta);
+        if (idx >= 0) filtered.splice(idx, 1);
+        container.appendChild(createEntryCard(labelName, bestInList, bestInList._meta_filename || null, true));
+      }
+
+      // Render the remainder (non-highlighted)
+      for (const e of filtered) {
+        container.appendChild(createEntryCard(labelName, e, e._meta_filename || null, false));
+      }
+    }
+
+    appendFiltered(tentList, tentLog, 'tent', currentBestTent);
+    appendFiltered(manList, manLog, 'mannequin', currentBestMan);
+
+    // Render the most recent raw image pulled from the imaging GS (served under best.gs)
+    const gsPanel = document.getElementById('gs-panel');
+    gsPanel.innerHTML = '';
+    try {
+      const gsList = best.gs || [];
+      if (gsList.length === 0) {
+        gsPanel.innerHTML = '<div class="gs-card empty">No recent ground-station pulls</div>';
+      } else {
+        const latest = gsList[0];
+        // Build a minimal GS card: image + assignment only
+        const card = document.createElement('div');
+        card.className = 'gs-card';
+        const tsDiv = document.createElement('div');
+        tsDiv.className = 'timestamp';
+        tsDiv.textContent = fmtTs(latest.timestamp);
+        card.appendChild(tsDiv);
+
+        const img = new Image();
+        const canvas = document.createElement('canvas');
+        canvas.className = 'entry-canvas';
+        canvas.width = 320; canvas.height = 180;
+        card.appendChild(canvas);
+        img.onload = () => {
+          const ctx = canvas.getContext('2d');
+          const ratio = img.naturalWidth / img.naturalHeight;
+          const w = Math.min(320, img.naturalWidth);
+          const h = Math.round(w / ratio);
+          canvas.width = w; canvas.height = h;
+          ctx.drawImage(img, 0, 0, w, h);
+        };
+        img.onerror = () => {
+          const ctx = canvas.getContext('2d'); ctx.fillStyle = '#f3f3f3'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        };
+        img.src = '/export/' + (latest.full_image || '');
+
+        // Assignment block (minimal)
+        const assignDiv = document.createElement('div');
+        assignDiv.className = 'assignment';
+        assignDiv.innerHTML = '<strong>Assignment</strong><pre>' + JSON.stringify(latest.assignment || {}, null, 2) + '</pre>';
+        card.appendChild(assignDiv);
+
+        gsPanel.appendChild(card);
+      }
+    } catch (e) {
+      gsPanel.innerHTML = '<div class="gs-card empty">Error loading GS image</div>';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 10000);
+
+  // Live updates via Server-Sent Events: refresh on GS pulls or other events
+  try {
+    const es = new EventSource('/api/stream');
+    es.addEventListener('gs_pull', (e) => {
+      try { refresh(); } catch (err) { console.error('refresh failed', err); }
+    });
+    es.onopen = () => console.log('SSE connected');
+    es.onerror = (err) => console.warn('SSE error', err);
+  } catch (e) {
+    console.warn('SSE not available');
+  }
+</script>
+</body>
+</html>

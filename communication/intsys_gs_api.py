@@ -1,4 +1,6 @@
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import unquote
+import json as _json
 import json
 import os
 import io
@@ -16,6 +18,29 @@ from pathlib import Path
 EXPORT_DIR = Path(__file__).parent.parent / "export"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Simple Server-Sent Events (SSE) support for notifying frontend of new GS pulls
+SSE_CLIENTS = []
+SSE_LOCK = threading.Lock()
+
+def notify_sse(event: str, data: dict):
+    """Send an SSE event to all connected clients. Removes dead clients."""
+    payload = {
+        'event': event,
+        'data': data,
+    }
+    msg = f"event: {event}\ndata: {_json.dumps(data)}\n\n".encode('utf-8')
+    with SSE_LOCK:
+        for client in list(SSE_CLIENTS):
+            wfile = client.get('wfile')
+            try:
+                wfile.write(msg)
+                wfile.flush()
+            except Exception:
+                try:
+                    SSE_CLIENTS.remove(client)
+                except Exception:
+                    pass
+
 
 class ResultStore:
     """Thread-safe store for detection results pushed by the cloud server."""
@@ -25,10 +50,10 @@ class ResultStore:
         self.best_mannequin: tuple = None  # (assignment, ROI, Classification)
         self.best_tent: tuple = None       # (assignment, ROI, Classification)
 
-    def update(self, label: LabelType, assignment: dict, roi: ROI, classification: Classification, model_source: str = "", gemini_reason: str = ""):
-       print("POLLED!!!!")
+    def update(self, label: LabelType, assignment: dict, roi: ROI, classification: Classification, model_source: str = "", gemini_reason: str = "", meta_filename: str = None):
+       print("SENT FROM SERVER!!!!")
        with self._lock:
-            entry = (assignment, roi, classification, model_source, gemini_reason)
+            entry = (assignment, roi, classification, model_source, gemini_reason, meta_filename)
             if label == LabelType.MANNEQUIN:
                 self.best_mannequin = entry
                 print(f"[result_store] Updated mannequin (conf={classification.label[1]:.3f}, model={model_source})")
@@ -110,8 +135,206 @@ class MapCommandHandler(BaseHTTPRequestHandler):
     result_store: ResultStore = None
     
     def do_GET(self):
-        """Return current mapping pipeline status (mirrors hawk-ai GET /api/mapping/status)."""
+        """Handle mapping status, static files, and best-result API."""
+        path = unquote(self.path.split('?',1)[0])
         try:
+            # SSE stream endpoint for live updates
+            if path == '/api/stream':
+                # Send SSE headers and register client
+                self.send_response(200)
+                self.send_header('Content-type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.end_headers()
+                with SSE_LOCK:
+                    SSE_CLIENTS.append({'wfile': self.wfile})
+                try:
+                    # Keep connection alive; actual writes happen from notify_sse
+                    while True:
+                        time.sleep(60)
+                except Exception:
+                    with SSE_LOCK:
+                        # remove if present
+                        for c in list(SSE_CLIENTS):
+                            if c.get('wfile') is self.wfile:
+                                try: SSE_CLIENTS.remove(c)
+                                except Exception: pass
+                    return
+            # Serve frontend index
+            if path == '/' or path == '/index.html':
+                frontend_dir = Path(__file__).parent.parent / 'frontend'
+                index_file = frontend_dir / 'index.html'
+                if index_file.exists():
+                    content = index_file.read_bytes()
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+
+            # Serve exported images and meta files
+            if path.startswith('/export/'):
+                rel = path[len('/export/'):]
+                file_path = EXPORT_DIR / rel
+                if file_path.exists() and file_path.is_file():
+                    # Guess content type
+                    if str(file_path).lower().endswith('.jpg') or str(file_path).lower().endswith('.jpeg'):
+                        ctype = 'image/jpeg'
+                    elif str(file_path).lower().endswith('.json'):
+                        ctype = 'application/json'
+                    else:
+                        ctype = 'application/octet-stream'
+                    self.send_response(200)
+                    self.send_header('Content-type', ctype)
+                    self.end_headers()
+                    self.wfile.write(file_path.read_bytes())
+                    return
+
+            # API: latest best metadata for both labels
+            if path == '/api/best':
+                def load_meta_list(label_name: str, limit: int = 200):
+                    metas = []
+                    for mf in EXPORT_DIR.glob(f'meta_{label_name}_*.json'):
+                        try:
+                            with open(mf, 'r') as f:
+                                m = _json.load(f)
+                            # attach source meta filename for frontend identification
+                            m['_meta_filename'] = mf.name
+                            metas.append(m)
+                        except Exception:
+                            continue
+                    metas.sort(key=lambda m: m.get('timestamp', 0), reverse=True)
+                    return metas[:limit]
+
+                # Build response with lists and indicate the current best meta filename per label
+                mannequin_list = load_meta_list('mannequin')
+                tent_list = load_meta_list('tent')
+                # Also include raw GS pulls (meta_gs_*.json)
+                gs_list = load_meta_list('gs')
+
+                # Determine current best for mannequin: prefer result_store entry (meta filename stored),
+                # otherwise fall back to latest gd_backup meta if available.
+                current_best_mannequin = None
+                try:
+                    bm = self.result_store.get_mannequin() if self.result_store else None
+                    if bm is not None and len(bm) >= 6 and bm[5]:
+                        current_best_mannequin = bm[5]
+                    else:
+                        for m in mannequin_list:
+                            if m.get('model_source') == 'gd_backup':
+                                current_best_mannequin = m.get('_meta_filename')
+                                break
+                except Exception:
+                    current_best_mannequin = None
+
+                current_best_tent = None
+                try:
+                    bt = self.result_store.get_tent() if self.result_store else None
+                    if bt is not None and len(bt) >= 6 and bt[5]:
+                        current_best_tent = bt[5]
+                    else:
+                        for m in tent_list:
+                            if m.get('model_source') == 'gd_backup':
+                                current_best_tent = m.get('_meta_filename')
+                                break
+                except Exception:
+                    current_best_tent = None
+
+                # Also expose explicit "to_send" fields which indicate the meta
+                # file that would be used when `VisionClient.send_result()` runs
+                # (prefer cloud-pushed entry in result_store, else fall back to gd_backup).
+                # Also include in-memory cloud results (if present) so the
+                # frontend can show cloud-pulled bests even if no exported
+                # meta file exists on disk.
+                cloud_mannequin = None
+                cloud_tent = None
+                try:
+                    bm = self.result_store.get_mannequin() if self.result_store else None
+                    if bm is not None and len(bm) >= 3:
+                        assign, roi, classification = bm[0], bm[1], bm[2]
+                        bbox = list(roi.top_left) + list(roi.bottom_right) if roi is not None else []
+                        score = float(classification.label[1]) if classification is not None else 0.0
+                        cloud_mannequin = {
+                            'assignment': assign,
+                            'bbox': bbox,
+                            'score': score,
+                            'model_source': bm[3] if len(bm) > 3 else '',
+                            'gemini_reason': bm[4] if len(bm) > 4 else '',
+                            '_meta_filename': bm[5] if len(bm) > 5 else None,
+                            'full_image': None,
+                            'roi_image': None,
+                        }
+                        # If a meta filename was provided, try to read exported filenames
+                        try:
+                            mfname = cloud_mannequin.get('_meta_filename')
+                            if mfname:
+                                mfpath = EXPORT_DIR / mfname
+                                if mfpath.exists():
+                                    with open(mfpath, 'r') as _mf:
+                                        try:
+                                            _m = _json.load(_mf)
+                                            cloud_mannequin['full_image'] = _m.get('full_image')
+                                            cloud_mannequin['roi_image'] = _m.get('roi_image')
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                except Exception:
+                    cloud_mannequin = None
+
+                try:
+                    bt = self.result_store.get_tent() if self.result_store else None
+                    if bt is not None and len(bt) >= 3:
+                        assign, roi, classification = bt[0], bt[1], bt[2]
+                        bbox = list(roi.top_left) + list(roi.bottom_right) if roi is not None else []
+                        score = float(classification.label[1]) if classification is not None else 0.0
+                        cloud_tent = {
+                            'assignment': assign,
+                            'bbox': bbox,
+                            'score': score,
+                            'model_source': bt[3] if len(bt) > 3 else '',
+                            'gemini_reason': bt[4] if len(bt) > 4 else '',
+                            '_meta_filename': bt[5] if len(bt) > 5 else None,
+                            'full_image': None,
+                            'roi_image': None,
+                        }
+                        try:
+                            mfname = cloud_tent.get('_meta_filename')
+                            if mfname:
+                                mfpath = EXPORT_DIR / mfname
+                                if mfpath.exists():
+                                    with open(mfpath, 'r') as _mf:
+                                        try:
+                                            _m = _json.load(_mf)
+                                            cloud_tent['full_image'] = _m.get('full_image')
+                                            cloud_tent['roi_image'] = _m.get('roi_image')
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                except Exception:
+                    cloud_tent = None
+
+                resp = {
+                    'mapping_running': self.mapper.mapping_running,
+                    'mapping_result': self.mapper.mapping_result,
+                    'mannequin': mannequin_list,
+                    'tent': tent_list,
+                    'gs': gs_list,
+                    'current_best_mannequin_meta': current_best_mannequin,
+                    'current_best_tent_meta': current_best_tent,
+                    'to_send_mannequin_meta': current_best_mannequin,
+                    'to_send_tent_meta': current_best_tent,
+                    'cloud_mannequin': cloud_mannequin,
+                    'cloud_tent': cloud_tent,
+                }
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(_json.dumps(resp).encode())
+                return
+
+            # Default: mapping status (backwards compatibility)
             response = {
                 "mapping_running": self.mapper.mapping_running,
                 "mapping_result": self.mapper.mapping_result,
@@ -119,12 +342,12 @@ class MapCommandHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
+            self.wfile.write(_json.dumps(response).encode())
         except Exception as e:
             self.send_response(500)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+            self.wfile.write(_json.dumps({"status": "error", "message": str(e)}).encode())
 
     def _read_json_body(self):
         content_length = int(self.headers.get('Content-Length', 0))
@@ -174,25 +397,39 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
                 # Write metadata sidecar JSON for full and roi images
                 try:
-                    meta = {
-                        "timestamp": ts,
-                        "label": str(label).lower() if label is not None else None,
-                        "assignment_id": assignment.get("id") if assignment else None,
-                        "model_source": model_source,
-                        "gemini_reason": gemini_reason,
-                        "score": float(data.get("score", 0.0)),
-                        "full_image": str(full_fn.name),
-                        "roi_image": str(roi_fn.name),
-                    }
-                    meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
-                    with open(meta_fn, "w") as mf:
-                        json.dump(meta, mf)
+                        meta = {
+                            "timestamp": ts,
+                            "label": str(label).lower() if label is not None else None,
+                            "assignment_id": assignment.get("id") if assignment else None,
+                            "assignment": assignment,
+                            "model_source": model_source,
+                            "gemini_reason": gemini_reason,
+                            "score": float(data.get("score", 0.0)),
+                            "full_image": str(full_fn.name),
+                            "roi_image": str(roi_fn.name),
+                            "bbox": list(roi.top_left) + list(roi.bottom_right),
+                            # Mark that this meta was created by a cloud push
+                            "pushed": True,
+                        }
+                        meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                        with open(meta_fn, "w") as mf:
+                            json.dump(meta, mf)
+                        mf_name = meta_fn.name
                 except Exception as e:
                     print_red(f"[result_push] Failed to write metadata sidecar: {e}")
             except Exception as e:
                 print_red(f"[result_push] Failed to save exported images: {e}")
 
-            self.result_store.update(label, assignment, roi, classification, model_source, gemini_reason)
+            # Update the in-memory result store and include the meta filename so the frontend
+            # can identify which exported meta corresponds to the current best.
+            try:
+                self.result_store.update(label, assignment, roi, classification, model_source, gemini_reason, mf_name)
+            except Exception:
+                # Fallback to updating without meta filename
+                try:
+                    self.result_store.update(label, assignment, roi, classification, model_source, gemini_reason)
+                except Exception:
+                    pass
             self._json_response(200, {"status": "ok", "label": data.get("label", str(label))})
         except Exception as e:
             print_red(f"[result_push] Failed to parse result payload: {e}")
