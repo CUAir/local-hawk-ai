@@ -11,11 +11,15 @@ RATIO_TEST = 0.75         # Lowe's recommended threshold; tighter reduces false 
 RANSAC_REPROJ = 6.0
 SIFT_FEATURES = 8000
 SIFT_CONTRAST = 0.005
+CLAHE_CLIP = 2.0
+CLAHE_TILE = 8
+AKAZE_THRESH = 0.005
+AKAZE_RATIO_TEST = 0.90
 GPS_DIR_COS_MIN = 0.35    # Require SIFT-predicted direction within ~70° of GPS direction
 GPS_MAG_MIN = 0.1
 GPS_MAG_MAX = 2.5         # Reject if SIFT says image is >2.5x farther than GPS suggests
 GPS_MIN_DIST_M = 2.0
-GPS_ABS_MAX_M = 15.0              # GPS absolute position tolerance; beyond this, try to GPS-correct rather than reject
+GPS_ABS_MAX_M = 22.0              # GPS absolute position tolerance; beyond this, try to GPS-correct rather than reject
 GPS_ABS_CORRECT_MIN_INLIERS = 30  # If inliers >= this and GPS abs fails, shift chain to GPS position instead of rejecting
 MIN_PLACEMENT_INLIERS = 25        # Minimum RANSAC inliers for passes 2+ (lenient for harder datasets)
 MIN_PLACEMENT_INLIERS_PASS1 = 50  # Stricter floor for pass 1 (sparse anchor graph = higher bad-seed risk)
@@ -84,11 +88,16 @@ def _grid_candidates(grid, pos, cell_size):
 
 
 def _extract_one(args):
-    """Extract SIFT features for a single image (runs in thread pool)."""
+    """Extract SIFT(primary) + AKAZE(fallback) features for one image."""
     i, img = args
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(CLAHE_TILE, CLAHE_TILE))
+    enhanced = clahe.apply(gray)
     sift = cv2.SIFT_create(nfeatures=SIFT_FEATURES, contrastThreshold=SIFT_CONTRAST)
-    kp, des = sift.detectAndCompute(img, None)
-    return i, (kp, des)
+    akaze = cv2.AKAZE_create(threshold=AKAZE_THRESH)
+    kp_s, des_s = sift.detectAndCompute(enhanced, None)
+    kp_a, des_a = akaze.detectAndCompute(enhanced, None)
+    return i, (kp_s, des_s, kp_a, des_a)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +136,7 @@ def stitch_geolocated_images(images: List[np.ndarray],
     _grid_add(placed_grid, 0, positions[0], cell_size)
 
     # --- PARALLEL feature extraction ---
-    print(f"Pre-computing SIFT features ({NUM_WORKERS} workers)...")
+    print(f"Pre-computing features (SIFT primary + AKAZE fallback, {NUM_WORKERS} workers)...")
     img_features = [None] * num_images
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         for i, feat in executor.map(_extract_one, enumerate(images)):
@@ -135,11 +144,103 @@ def stitch_geolocated_images(images: List[np.ndarray],
             if (i + 1) % 50 == 0:
                 print(f"  Extracted {i+1}/{num_images}")
 
-    bf = cv2.BFMatcher()
+    bf_l2 = cv2.BFMatcher(cv2.NORM_L2)
+    bf_ham = cv2.BFMatcher(cv2.NORM_HAMMING)
     unplaced = set(range(1, num_images))
     pass_num = 1
     # Collect (i, anchor, H_i_to_anchor) from successful placements for refinement
     placement_links: List[Tuple[int, int, np.ndarray]] = []
+
+    def _try_link_candidate(
+        i: int,
+        idx: int,
+        h_n: int,
+        w_n: int,
+        kp_new,
+        des_new,
+        kp_ref,
+        des_ref,
+        matcher,
+        ratio_test: float,
+        pass_min: int,
+    ):
+        if des_new is None or des_ref is None:
+            return None
+        if len(kp_new) < max(pass_min, match_threshold // 2):
+            return None
+        if len(kp_ref) < max(pass_min, match_threshold // 2):
+            return None
+
+        matches = matcher.knnMatch(des_new, des_ref, k=2)
+        good = [m for m, n in matches if m.distance < ratio_test * n.distance]
+        if len(good) < max(pass_min, match_threshold // 2):
+            return None
+
+        src_pts = np.float32([kp_new[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        # Similarity transform is still the primary model.
+        M_sim, mask = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC,
+            ransacReprojThreshold=RANSAC_REPROJ)
+        if M_sim is None or mask is None:
+            return None
+        inliers = int(mask.sum())
+        if inliers < max(pass_min, match_threshold // 2):
+            return None
+        H_rel = np.vstack([M_sim, [0, 0, 1]])  # 2×3 → 3×3, no projective row
+
+        area_ratio = _homography_area_ratio(H_rel, w_n, h_n)
+        if area_ratio < 0.3 or area_ratio > 3.0:
+            return None
+
+        try:
+            rot_deg = abs(np.degrees(np.arctan2(H_rel[1, 0], H_rel[0, 0])))
+        except Exception:
+            rot_deg = 0.0
+        if rot_deg > 20.0:
+            return None
+
+        center_new = np.float32([[[w_n / 2, h_n / 2]]])
+        proj_center = cv2.perspectiveTransform(center_new, H_rel)[0][0]
+        h_ref, w_ref = images[idx].shape[:2]
+        vec_sift = np.array([proj_center[0] - w_ref / 2,
+                             proj_center[1] - h_ref / 2])
+        exp_dx, exp_dy = _get_gps_pixel_delta(coordinates[idx], coordinates[i],
+                                              ref_lat, PPM)
+        vec_gps = np.array([exp_dx, exp_dy])
+        mag_sift = np.linalg.norm(vec_sift)
+        mag_gps = np.linalg.norm(vec_gps)
+        if mag_gps > GPS_MIN_DIST_M * PPM:
+            cos_sim = np.dot(vec_sift, vec_gps) / (mag_sift * mag_gps + 1e-10)
+            if cos_sim < GPS_DIR_COS_MIN:
+                return None
+            if mag_sift < GPS_MAG_MIN * mag_gps or mag_sift > GPS_MAG_MAX * mag_gps:
+                return None
+
+        H_cand = placed_info[idx]["H"].dot(H_rel)
+        H_cand_norm = H_cand.copy()
+        H_cand_norm[2, 0] = 0.0
+        H_cand_norm[2, 1] = 0.0
+        if abs(H_cand_norm[2, 2]) > 1e-10:
+            H_cand_norm /= H_cand_norm[2, 2]
+        actual_c = cv2.perspectiveTransform(
+            np.float32([[[w_n / 2, h_n / 2]]]), H_cand_norm)[0][0]
+        h0, w0 = images[0].shape[:2]
+        abs_dx, abs_dy = _get_gps_pixel_delta(
+            coordinates[0], coordinates[i], ref_lat, PPM)
+        gps_c = np.array([w0 / 2 + abs_dx, h0 / 2 + abs_dy])
+        gps_abs_dev_m = np.linalg.norm(actual_c - gps_c) / PPM
+        if gps_abs_dev_m > GPS_ABS_MAX_M:
+            if inliers < GPS_ABS_CORRECT_MIN_INLIERS:
+                return None  # Too few inliers to trust rotation/scale — reject
+            corr = gps_c - actual_c
+            T_corr = np.eye(3, dtype=np.float64)
+            T_corr[0, 2] = corr[0]
+            T_corr[1, 2] = corr[1]
+            H_cand_norm = T_corr.dot(H_cand_norm)
+
+        return H_cand_norm, H_rel, inliers
 
     while unplaced:
         print(f"--- Pass {pass_num} (unplaced: {len(unplaced)}) ---")
@@ -147,11 +248,13 @@ def stitch_geolocated_images(images: List[np.ndarray],
 
         for i in sorted(unplaced):
             img_to_add = images[i]
-            kp_new, des_new = img_features[i]
+            kp_s_new, des_s_new, kp_a_new, des_a_new = img_features[i]
             h_n, w_n = img_to_add.shape[:2]
 
             # GPS fallback for feature-poor images
-            if des_new is None or len(kp_new) < max(4, match_threshold // 2):
+            sift_poor = (des_s_new is None or len(kp_s_new) < max(4, match_threshold // 2))
+            akaze_poor = (des_a_new is None or len(kp_a_new) < max(4, match_threshold // 2))
+            if sift_poor and akaze_poor:
                 print(f"  Image {i}: poor features, GPS fallback.")
                 nearest, _ = _nearest_placed(i, placed_indices, positions)
                 if nearest is not None:
@@ -193,93 +296,27 @@ def stitch_geolocated_images(images: List[np.ndarray],
             pass_min = MIN_PLACEMENT_INLIERS_PASS1 if pass_num == 1 else MIN_PLACEMENT_INLIERS
 
             for idx, _ in potential_anchors[:MAX_ANCHORS]:
-                kp_ref, des_ref = img_features[idx]
-                if des_ref is None:
+                kp_s_ref, des_s_ref, kp_a_ref, des_a_ref = img_features[idx]
+
+                # SIFT remains primary matching path.
+                candidate = _try_link_candidate(
+                    i, idx, h_n, w_n,
+                    kp_s_new, des_s_new, kp_s_ref, des_s_ref,
+                    bf_l2, RATIO_TEST, pass_min,
+                )
+                # AKAZE is only a conditional fallback if SIFT can't link this anchor.
+                if candidate is None:
+                    candidate = _try_link_candidate(
+                        i, idx, h_n, w_n,
+                        kp_a_new, des_a_new, kp_a_ref, des_a_ref,
+                        bf_ham, AKAZE_RATIO_TEST, pass_min,
+                    )
+                if candidate is None:
                     continue
 
-                matches = bf.knnMatch(des_new, des_ref, k=2)
-                good = [m for m, n in matches if m.distance < RATIO_TEST * n.distance]
-                if len(good) < max(pass_min, match_threshold // 2):
-                    continue
-
-                src_pts = np.float32([kp_new[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-                # --- Similarity transform (rotation + uniform scale + translation) ---
-                # estimateAffinePartial2D prevents shear/non-uniform-scale accumulation
-                # in long chains — the correct model for nadir aerial imagery.
-                M_sim, mask = cv2.estimateAffinePartial2D(
-                    src_pts, dst_pts, method=cv2.RANSAC,
-                    ransacReprojThreshold=RANSAC_REPROJ)
-                if M_sim is None or mask is None:
-                    continue
-                inliers = int(mask.sum())
-                if inliers < max(pass_min, match_threshold // 2):
-                    continue
-                H_rel = np.vstack([M_sim, [0, 0, 1]])  # 2×3 → 3×3, no projective row
-
-                # Area-ratio sanity check
-                area_ratio = _homography_area_ratio(H_rel, w_n, h_n)
-                if area_ratio < 0.3 or area_ratio > 3.0:
-                    continue
-
-                # Rotation sanity from upper-left 2×2
-                try:
-                    rot_deg = abs(np.degrees(np.arctan2(H_rel[1, 0], H_rel[0, 0])))
-                except Exception:
-                    rot_deg = 0.0
-                if rot_deg > 20.0:
-                    continue
-
-                # GPS direction / magnitude sanity check
-                center_new = np.float32([[[w_n / 2, h_n / 2]]])
-                proj_center = cv2.perspectiveTransform(center_new, H_rel)[0][0]
-                h_ref, w_ref = images[idx].shape[:2]
-                vec_sift = np.array([proj_center[0] - w_ref / 2,
-                                     proj_center[1] - h_ref / 2])
-                exp_dx, exp_dy = _get_gps_pixel_delta(coordinates[idx], coordinates[i],
-                                                       ref_lat, PPM)
-                vec_gps = np.array([exp_dx, exp_dy])
-                mag_sift = np.linalg.norm(vec_sift)
-                mag_gps = np.linalg.norm(vec_gps)
-                if mag_gps > GPS_MIN_DIST_M * PPM:
-                    cos_sim = np.dot(vec_sift, vec_gps) / (mag_sift * mag_gps + 1e-10)
-                    if cos_sim < GPS_DIR_COS_MIN:
-                        continue
-                    if mag_sift < GPS_MAG_MIN * mag_gps or mag_sift > GPS_MAG_MAX * mag_gps:
-                        continue
-
-                # GPS absolute-position check — catch chain error propagation.
-                # Compute where this image's center lands in canvas and verify
-                # it's within GPS_ABS_MAX_M meters of the GPS-predicted position.
-                H_cand = placed_info[idx]["H"].dot(H_rel)
-                H_cand_norm = H_cand.copy()
-                H_cand_norm[2, 0] = 0.0
-                H_cand_norm[2, 1] = 0.0
-                if abs(H_cand_norm[2, 2]) > 1e-10:
-                    H_cand_norm /= H_cand_norm[2, 2]
-                actual_c = cv2.perspectiveTransform(
-                    np.float32([[[w_n / 2, h_n / 2]]]), H_cand_norm)[0][0]
-                h0, w0 = images[0].shape[:2]
-                abs_dx, abs_dy = _get_gps_pixel_delta(
-                    coordinates[0], coordinates[i], ref_lat, PPM)
-                gps_c = np.array([w0 / 2 + abs_dx, h0 / 2 + abs_dy])
-                gps_abs_dev_m = np.linalg.norm(actual_c - gps_c) / PPM
-                if gps_abs_dev_m > GPS_ABS_MAX_M:
-                    if inliers < GPS_ABS_CORRECT_MIN_INLIERS:
-                        continue  # Too few inliers to trust rotation/scale — reject
-                    # High-confidence SIFT match but wrong absolute position.
-                    # Preserve the SIFT rotation/scale and shift the chain to the
-                    # GPS-predicted absolute position (chain GPS re-anchor).
-                    corr = gps_c - actual_c
-                    T_corr = np.eye(3, dtype=np.float64)
-                    T_corr[0, 2] = corr[0]
-                    T_corr[1, 2] = corr[1]
-                    H_cand_norm = T_corr.dot(H_cand_norm)
-
+                H_cand_norm, H_rel, inliers = candidate
                 if inliers > max_inliers:
                     max_inliers = inliers
-                    # H_cand_norm already has projective stripped and GPS correction applied if needed
                     best_H_to_map = H_cand_norm
                     best_anchor = idx
                     best_H_rel = H_rel
@@ -372,16 +409,28 @@ def stitch_geolocated_images(images: List[np.ndarray],
             key=lambda x: x[1]
         )[:6]
         for j, _ in neighs:
-            kp_new, des_new = img_features[idx]
-            kp_ref, des_ref = img_features[j]
-            if des_new is None or des_ref is None:
-                continue
-            matches = bf.knnMatch(des_new, des_ref, k=2)
-            good = [m for m, n in matches if m.distance < 0.85 * n.distance]
+            kp_s_new, des_s_new, kp_a_new, des_a_new = img_features[idx]
+            kp_s_ref, des_s_ref, kp_a_ref, des_a_ref = img_features[j]
+
+            # SIFT primary in re-alignment; AKAZE only if SIFT has no viable matches.
+            good = []
+            use_akaze = False
+            if des_s_new is not None and des_s_ref is not None:
+                matches = bf_l2.knnMatch(des_s_new, des_s_ref, k=2)
+                good = [m for m, n in matches if m.distance < RATIO_TEST * n.distance]
+            if len(good) < MIN_LOCAL_INLIERS and des_a_new is not None and des_a_ref is not None:
+                matches = bf_ham.knnMatch(des_a_new, des_a_ref, k=2)
+                good = [m for m, n in matches if m.distance < AKAZE_RATIO_TEST * n.distance]
+                use_akaze = True
             if len(good) < MIN_LOCAL_INLIERS:
                 continue
-            src_pts = np.float32([kp_new[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+            if use_akaze:
+                src_pts = np.float32([kp_a_new[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp_a_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            else:
+                src_pts = np.float32([kp_s_new[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp_s_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
             M_sim, mask = cv2.estimateAffinePartial2D(
                 src_pts, dst_pts, method=cv2.RANSAC,
                 ransacReprojThreshold=RANSAC_REPROJ)
@@ -465,16 +514,28 @@ def stitch_geolocated_images(images: List[np.ndarray],
 
             bridge_found = False
             for a, b, _ in bridge_candidates[:30]:
-                kp_a, des_a = img_features[a]
-                kp_b, des_b = img_features[b]
-                if des_a is None or des_b is None:
-                    continue
-                matches = bf.knnMatch(des_b, des_a, k=2)
-                good = [m for m, n in matches if m.distance < 0.85 * n.distance]
+                kp_s_a, des_s_a, kp_a_a, des_a_a = img_features[a]
+                kp_s_b, des_s_b, kp_a_b, des_a_b = img_features[b]
+
+                # Bridge match uses SIFT first; AKAZE only when SIFT is insufficient.
+                good = []
+                use_akaze = False
+                if des_s_a is not None and des_s_b is not None:
+                    matches = bf_l2.knnMatch(des_s_b, des_s_a, k=2)
+                    good = [m for m, n in matches if m.distance < RATIO_TEST * n.distance]
+                if len(good) < BRIDGE_MIN_INLIERS and des_a_a is not None and des_a_b is not None:
+                    matches = bf_ham.knnMatch(des_a_b, des_a_a, k=2)
+                    good = [m for m, n in matches if m.distance < AKAZE_RATIO_TEST * n.distance]
+                    use_akaze = True
                 if len(good) < BRIDGE_MIN_INLIERS:
                     continue
-                src_pts = np.float32([kp_b[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_a[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+                if use_akaze:
+                    src_pts = np.float32([kp_a_b[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp_a_a[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                else:
+                    src_pts = np.float32([kp_s_b[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp_s_a[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
                 M_sim, mask = cv2.estimateAffinePartial2D(
                     src_pts, dst_pts, method=cv2.RANSAC,
                     ransacReprojThreshold=RANSAC_REPROJ)
