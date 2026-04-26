@@ -19,6 +19,8 @@
     canvas.entry-canvas { width:100%; height:auto; display:block }
     .gs-column { flex: 0 0 360px; }
     .gs-card { border:1px solid #ddd; padding:12px; border-radius:6px; background:#fafafa }
+    .notify { background:#fff8e1; border-left:4px solid #f0ad4e; padding:8px; margin-bottom:8px }
+    .notify small { color:#666; display:block }
     .assignment { margin-top:8px; }
     .assignment pre { font-size:12px; line-height:1.2; max-height:6em; overflow:auto; margin:6px 0 0 0; white-space:pre-wrap; }
   </style>
@@ -26,6 +28,7 @@
 <body>
   <h1>Local Hawk AI — Latest Results</h1>
   <p>Shows the most recent saved result for each label (tent, mannequin). Images may come from cloud push or local GD backup.</p>
+  <div id="notifications"></div>
   <div class="container">
     <div class="column">
       <div class="label">Tent</div>
@@ -54,6 +57,23 @@ async function fetchBest() {
     const d = new Date(ts);
     return d.toLocaleString();
   }
+  // Track duplicate counts by signature (assignment_id|bbox|score)
+  const duplicateCounts = {};
+  function _sigFromParts(aid, bbox, score) {
+    try {
+      const b = (bbox && Array.isArray(bbox)) ? bbox.join(',') : '';
+      const s = (typeof score === 'number') ? Math.round(score * 1e6) : ('' + score);
+      return `${aid}|${b}|${s}`;
+    } catch (e) { return null; }
+  }
+  function sigFromData(data) {
+    try {
+      const aid = data.assignment_id || (data.assignment && data.assignment.id) || '';
+      const bbox = data.bbox || [];
+      const score = (data.score !== undefined ? data.score : null);
+      return _sigFromParts(aid, bbox, score);
+    } catch (e) { return null; }
+  }
 
   function createEntryCard(label, data, metaFilename, isBest) {
     const card = document.createElement('div');
@@ -61,9 +81,25 @@ async function fetchBest() {
     const ts = data.timestamp;
     const header = document.createElement('div');
     header.innerHTML = `<div class="timestamp">${fmtTs(ts)}</div>`;
+    // Show duplicate count badge on card if present
+    try {
+      const sig = sigFromData(data);
+      if (sig && duplicateCounts[sig] && duplicateCounts[sig] > 0) {
+        const badge = document.createElement('div');
+        badge.style.color = '#b36b00';
+        badge.style.fontWeight = '600';
+        badge.style.marginTop = '6px';
+        badge.textContent = `Duplicates: ${duplicateCounts[sig]}`;
+        header.appendChild(badge);
+      }
+    } catch (e) {}
     card.appendChild(header);
 
-    const imgSrc = '/export/' + (data.full_image || '');
+    let imgSrc = '/export/' + (data.full_image || '');
+    // Prefer inline base64 data if provided by the server to avoid extra fetch races
+    if (data.full_image_b64) {
+      imgSrc = data.full_image_b64;
+    }
     const canvas = document.createElement('canvas');
     canvas.className = 'entry-canvas';
     canvas.width = 640; canvas.height = 360;
@@ -153,8 +189,17 @@ async function fetchBest() {
         let cloudBest = null;
         if (labelName === 'tent' && cloudTent) cloudBest = cloudTent;
         if (labelName === 'mannequin' && cloudMan) cloudBest = cloudMan;
+        // If the cloud in-memory best corresponds to an exported meta that we're
+        // also about to render, prefer the exported meta and skip the cloud-only
+        // card to avoid showing two highlighted entries. If a cloud best exists
+        // but has no matching exported meta, render the cloud card (highlighted).
         if (cloudBest) {
-          // Render a special cloud card (no exported image available)
+          if (currentBestMeta && cloudBest._meta_filename && cloudBest._meta_filename === currentBestMeta) {
+            // Exported meta will be rendered below as the pinned best; skip cloud-only card
+            cloudBest = null;
+          }
+        }
+        if (cloudBest) {
           const cloudData = {
             timestamp: Date.now(),
             assignment_id: (cloudBest.assignment && cloudBest.assignment.id) || null,
@@ -164,9 +209,14 @@ async function fetchBest() {
             gemini_reason: cloudBest.gemini_reason || null,
             bbox: cloudBest.bbox || null,
             full_image: null,
+            // server may include inline base64 to avoid separate /export fetch
+            full_image_b64: cloudBest.full_image_b64 || null,
+            roi_image_b64: cloudBest.roi_image_b64 || null,
           };
           const cloudCard = createEntryCard(labelName + ' (cloud)', cloudData, cloudBest._meta_filename || null, true);
           container.appendChild(cloudCard);
+          // Cloud best overrides GD backup pinned entry — don't render the exported pinned entry as well
+          bestInList = null;
         }
 
       if (filtered.length === 0 && !bestInList) {
@@ -183,6 +233,10 @@ async function fetchBest() {
 
       // Render the remainder (non-highlighted)
       for (const e of filtered) {
+        // Skip exported meta entries that duplicate the in-memory cloud-pulled best
+        if (cloudBest && cloudBest._meta_filename && e._meta_filename && cloudBest._meta_filename === e._meta_filename) {
+          continue;
+        }
         container.appendChild(createEntryCard(labelName, e, e._meta_filename || null, false));
       }
     }
@@ -246,6 +300,16 @@ async function fetchBest() {
     const es = new EventSource('/api/stream');
     es.addEventListener('gs_pull', (e) => {
       try { refresh(); } catch (err) { console.error('refresh failed', err); }
+    });
+    es.addEventListener('duplicate', (e) => {
+      try {
+        const data = JSON.parse(e.data || '{}');
+        const sig = sigFromData(data);
+        if (sig) {
+          duplicateCounts[sig] = (duplicateCounts[sig] || 0) + 1;
+        }
+        try { refresh(); } catch (err) {}
+      } catch (err) { console.error('duplicate event parse', err); }
     });
     es.onopen = () => console.log('SSE connected');
     es.onerror = (err) => console.warn('SSE error', err);

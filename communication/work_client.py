@@ -75,14 +75,13 @@ class WorkClient(object):
         except Exception as e:
             print_red(f"[work_client] Invalid candidate JSON response: {e}")
             return None, None, None
-
         bbox = candidate.get("bbox") or []
         score = float(candidate.get("score", 0.0))
         label = self._parse_label(candidate.get("label"))
 
-        source = candidate.get("source") or {}
-        source_b64 = source.get("base64_image")
-        assignment = source.get("assignment")
+
+        source_b64 = candidate.get("base64_image")
+        assignment = candidate.get("assignment")
         full_image = self._decode_base64_image(source_b64)
 
         if full_image is None or len(bbox) != 4:
