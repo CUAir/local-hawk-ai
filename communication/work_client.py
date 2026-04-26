@@ -1,5 +1,7 @@
-import typing, requests, time, io, json
+import typing, requests, time, io, json, logging
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 from constructs.roi import ROI
 from constructs.classification import Classification, LabelType
 import base64
@@ -160,6 +162,7 @@ class WorkClient(object):
                     "telemetry": meta["image"]["telemetry"],
                     "imgMode": meta["image"]["imgMode"],
                 }
+                logger.info("Assignment received — id=%s imgMode=%s", data.get('id'), data.get('imgMode'))
                 print(f"[work_client] Received assignment {data['id']} (endpoint={data['endpoint']})")
                 return assignment, data
             else:
@@ -196,12 +199,14 @@ class WorkClient(object):
 
         payload = {"base64_image": img_base64, "id": assignment["id"], "meta": None, "assignment": assignment}
         
+        logger.info("Sending image to cloud — id=%s url=%s", assignment["id"], self.cs_url + self.upload_img_endp)
         # Send request to cloud server
         response = requests.post(
             self.cs_url + self.upload_img_endp,
             json=payload,  # automatically sets Content-Type: application/json
             timeout=self.http_timeout_seconds,
         )
+        logger.info("Cloud server response — id=%s status=%s", assignment["id"], response.status_code)
 
         if 200 <= response.status_code < 300:
             print(f"[work_client] Uploaded image to cloud (assignment_id={assignment['id']}, status={response.status_code})")
@@ -277,6 +282,7 @@ class WorkClient(object):
             "height": height,
             # 'targetId': targetId,
         }
+        logger.info("Submitting ADLC output — id=%s label=%s conf=%.3f", assignment['id'], data.get('targetLabel'), data.get('targetConfidence', 0))
         print(
             f"[work_client] Sending ADLC output to GS "
             f"(assignment_id={assignment.get('id')}, label={label}, conf={number_conf:.3f}, "

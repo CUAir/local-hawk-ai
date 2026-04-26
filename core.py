@@ -24,12 +24,27 @@ import json
 from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
+import logging
 from constructs.detection import GDDetection
 from constructs.image_types import Base64Image, LabelTypes
 
 
 # Keep color only for section headers; all other logs are plain text.
 header = print_green
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_file_logging() -> Path:
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = logs_dir / f"local_hawk_ai_{date_str}.log"
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+    return log_path
 
 
 GD_model = GDDetection()
@@ -371,6 +386,7 @@ class VisionClient:
             image = self.work_client.get_image(metadata["endpoint"])
             break
         self.image = image
+        logger.info("Image received from GS — id=%s endpoint=%s", metadata.get('id'), metadata.get('endpoint'))
         self.mapper.mark_image_received()
 
         # Export the raw ground-station pull (no processing yet) to EXPORT_DIR
@@ -660,6 +676,8 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
         time.sleep(IDLE_MAPPING_POLL_SECONDS)
 
 def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8080, result_interval_seconds: float = 10.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS):
+    log_path = _setup_file_logging()
+    logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
     header(
         f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
         f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s"
