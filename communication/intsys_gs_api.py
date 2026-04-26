@@ -47,29 +47,78 @@ class ResultStore:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.best_mannequin: tuple = None  # (assignment, ROI, Classification)
-        self.best_tent: tuple = None       # (assignment, ROI, Classification)
+        # Separate storage for cloud-pulled entries (most-recent wins)
+        self._cloud: dict = {"tent": None, "mannequin": None}
+        # Storage for best GD backups per label (highest-confidence wins)
+        self._gd_best: dict = {"tent": None, "mannequin": None}
 
     def update(self, label: LabelType, assignment: dict, roi: ROI, classification: Classification, model_source: str = "", gemini_reason: str = "", meta_filename: str = None):
-       print("SENT FROM SERVER!!!!")
+       """Update the store.
+
+       Rules:
+       - Cloud-pulled entries (`model_source` contains 'cloud') are stored as the canonical cloud best
+         and always preferred when present.
+       - GD backup entries (`model_source == 'gd_backup'`) are kept only if they have the highest
+         confidence seen so far for that label (used when no cloud entry exists).
+       """
        with self._lock:
             entry = (assignment, roi, classification, model_source, gemini_reason, meta_filename)
-            if label == LabelType.MANNEQUIN:
-                self.best_mannequin = entry
-                print(f"[result_store] Updated mannequin (conf={classification.label[1]:.3f}, model={model_source})")
-            elif label == LabelType.TENT:
-                self.best_tent = entry
-                print(f"[result_store] Updated tent (conf={classification.label[1]:.3f}, model={model_source})")
-            else:
+            # Normalize label to string
+            lbl = None
+            try:
+                if label == LabelType.MANNEQUIN or str(label).lower().find('mannequin') >= 0:
+                    lbl = 'mannequin'
+                elif label == LabelType.TENT or str(label).lower().find('tent') >= 0:
+                    lbl = 'tent'
+            except Exception:
+                lbl = None
+
+            if lbl is None:
                 print_yellow(f"[result_store] Received unknown label: {label}")
+                return
+
+            # Cloud entries win unconditionally (most-recent cloud_pull overrides anything)
+            if model_source and 'cloud' in model_source:
+                self._cloud[lbl] = entry
+                try:
+                    conf = float(classification.label[1]) if classification is not None else 0.0
+                except Exception:
+                    conf = 0.0
+                print(f"[result_store] Updated cloud {lbl} (conf={conf:.3f}, model={model_source})")
+                return
+
+            # GD backup: keep only the highest-confidence GD backup for this label
+            if model_source == 'gd_backup':
+                try:
+                    conf = float(classification.label[1]) if classification is not None else 0.0
+                except Exception:
+                    conf = 0.0
+                prev = self._gd_best.get(lbl)
+                prev_conf = -1.0
+                if prev is not None and len(prev) >= 3 and prev[2] is not None:
+                    try:
+                        prev_conf = float(prev[2].label[1])
+                    except Exception:
+                        prev_conf = -1.0
+                if prev is None or conf > prev_conf:
+                    self._gd_best[lbl] = entry
+                    print(f"[result_store] Updated GD backup {lbl} (conf={conf:.3f})")
+                else:
+                    print(f"[result_store] Kept existing GD backup {lbl} (conf={prev_conf:.3f}) over new {conf:.3f}")
+                return
+
+            # Fallback: treat other model sources as cloud entries
+            self._cloud[lbl] = entry
+            print(f"[result_store] Updated cloud-like {lbl} (model={model_source})")
 
     def get_mannequin(self):
         with self._lock:
-            return self.best_mannequin
+            # Prefer cloud entry if present, else GD backup
+            return self._cloud.get('mannequin') or self._gd_best.get('mannequin')
 
     def get_tent(self):
         with self._lock:
-            return self.best_tent
+            return self._cloud.get('tent') or self._gd_best.get('tent')
 
 
 def _parse_label(raw_label) -> LabelType:
@@ -331,6 +380,18 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
                                     cloud_mannequin['full_image'] = full_fname if full_fname else None
                                     cloud_mannequin['roi_image'] = roi_fname if roi_fname else None
+                                    # Attach base64 image data for frontend convenience
+                                    try:
+                                        if full_fname and (EXPORT_DIR / full_fname).exists():
+                                            with open(EXPORT_DIR / full_fname, 'rb') as _fimg:
+                                                import base64 as _b64
+                                                cloud_mannequin['full_image_b64'] = 'data:image/jpeg;base64,' + _b64.b64encode(_fimg.read()).decode('utf-8')
+                                        if roi_fname and (EXPORT_DIR / roi_fname).exists():
+                                            with open(EXPORT_DIR / roi_fname, 'rb') as _fimg2:
+                                                import base64 as _b642
+                                                cloud_mannequin['roi_image_b64'] = 'data:image/jpeg;base64,' + _b642.b64encode(_fimg2.read()).decode('utf-8')
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
                 except Exception:
@@ -403,6 +464,18 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
                                     cloud_tent['full_image'] = full_fname if full_fname else None
                                     cloud_tent['roi_image'] = roi_fname if roi_fname else None
+                                    # Attach base64 image data for frontend convenience
+                                    try:
+                                        if full_fname and (EXPORT_DIR / full_fname).exists():
+                                            with open(EXPORT_DIR / full_fname, 'rb') as _fimg:
+                                                import base64 as _b64
+                                                cloud_tent['full_image_b64'] = 'data:image/jpeg;base64,' + _b64.b64encode(_fimg.read()).decode('utf-8')
+                                        if roi_fname and (EXPORT_DIR / roi_fname).exists():
+                                            with open(EXPORT_DIR / roi_fname, 'rb') as _fimg2:
+                                                import base64 as _b642
+                                                cloud_tent['roi_image_b64'] = 'data:image/jpeg;base64,' + _b642.b64encode(_fimg2.read()).decode('utf-8')
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
                 except Exception:

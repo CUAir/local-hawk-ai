@@ -24,11 +24,27 @@ import json
 from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
-from constructs.image_types import Base64Image, LabelTypes
+import logging
+from constructs.image_types import Base64Image, LabelTypes, ImageMeta, GeoLocation, CandidateImage
+from constructs.projection import GroundProjector
 
 
 # Keep color only for section headers; all other logs are plain text.
 header = print_green
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_file_logging() -> Path:
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = logs_dir / f"local_hawk_ai_{date_str}.log"
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+    return log_path
 
 
 GD_model = None
@@ -217,7 +233,7 @@ class Mapper:
         self.trigger_pipeline()
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, result_interval_seconds: float = 10.0):
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, autopilot_port: int = None, result_interval_seconds: float = 10.0):
         header("\n[vision] Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
@@ -225,153 +241,427 @@ class VisionClient:
         header("[vision] Initializing Mapper")
         self.mapper = mapper
         self.result_store = result_store
+        # Autopilot configuration
+        self.autopilot_host = autopilot_host
+        self.autopilot_port = autopilot_port
+        self.autopilot_url = None
+        if autopilot_host and autopilot_port:
+            self.autopilot_url = f"http://{autopilot_host}:{autopilot_port}/target"
+        # incremental id for autopilot messages
+        self._autopilot_id = 0
+        # projector for ground coordinates
+        self._projector = GroundProjector()
+
         self.result_interval_seconds = max(1.0, float(result_interval_seconds))
         self._send_lock = threading.Lock()
+        # Single background thread: poll cloud for results, then send to autopilot
         self._result_scheduler_thread = threading.Thread(
             target=self._result_scheduler_loop,
             daemon=True,
         )
         self._result_scheduler_thread.start()
 
-        # Background thread: poll cloud server for best images and update result_store
-        self._cloud_poller_thread = threading.Thread(
-            target=self._cloud_poller_loop,
-            daemon=True,
-        )
-        self._cloud_poller_thread.start()
+        # Track signatures of cloud detections we've already seen to
+        # avoid duplicate processing (assignment id, bbox, score).
+        self._seen_cloud_signatures = set()
 
         # GD backup: best detected candidate per label from the most recent image
         self._gd_best_mannequin: tuple = None  # (assignment, ROI, Classification)
         self._gd_best_tent: tuple = None        # (assignment, ROI, Classification)
 
     def _result_scheduler_loop(self):
-        print("TODO: bring this back")
-        # while True:
-        #     remaining = int(self.result_interval_seconds)
-        #     while remaining > 0:
-        #         # Log every 5 seconds, then every second in the last 5 seconds.
-        #         if remaining <= 5 or remaining % 5 == 0:
-        #             print(f"[scheduler] Next GS send in {remaining}s")
-        #         time.sleep(1)
-        #         remaining -= 1
+        while True:
+            remaining = int(self.result_interval_seconds)
+            while remaining > 0:
+                # Log every 5 seconds, then every second in the last 5 seconds.
+                if remaining <= 5 or remaining % 5 == 0:
+                    print_yellow(f"[scheduler] Next cloud poll / autopilot send in {remaining}s")
+                time.sleep(1)
+                remaining -= 1
 
-        #     if not self._send_lock.acquire(blocking=False):
-        #         print_yellow("[scheduler] send_result() already running; skipping this tick")
-        #         continue
-        #     try:
-        #         print_green("\n[scheduler] Sending current results to GS")
-        #         self.send_result()
-        #     except Exception as e:
-        #         print_red(f"[scheduler] send_result() failed: {e}")
-        #     finally:
-        #         self._send_lock.release()
+            # First: poll cloud once for new best images. Do not hold the send lock
+            # while polling (poll may perform I/O and filesystem writes).
+            try:
+                self._poll_cloud_once()
+            except Exception as e:
+                print_yellow(f"[scheduler] Cloud poll failed: {e}")
+
+            # Then: attempt to send results to autopilot (non-blocking acquire)
+            if not self._send_lock.acquire(blocking=False):
+                print_yellow("[scheduler] send_to_autopilot() already running; skipping this tick")
+                continue
+            try:
+                print_green("\n[scheduler] Sending current results to autopilot")
+                try:
+                    self.send_to_autopilot()
+                except Exception as e:
+                    print_red(f"[scheduler] send_to_autopilot() failed: {e}")
+            finally:
+                self._send_lock.release()
+
+            # loop repeats after interval
+
+    def _build_candidate_from_entry(self, assignment: dict, roi: ROI, classification: Classification, meta_filename: str = None, base64_override: str = None) -> CandidateImage:
+        """Construct a CandidateImage (with Base64Image.source.meta) suitable for GroundProjector.project()."""
+        # Try to get base64 full image from meta file
+        b64 = None
+        try:
+            if base64_override:
+                b64 = base64_override
+            elif meta_filename:
+                mfpath = EXPORT_DIR / meta_filename
+                if mfpath.exists():
+                    with open(mfpath, 'r') as _mf:
+                        try:
+                            m = json.load(_mf)
+                        except Exception:
+                            m = {}
+                    full_fname = m.get('full_image')
+                    if full_fname and (EXPORT_DIR / full_fname).exists():
+                        with open(EXPORT_DIR / full_fname, 'rb') as _fimg:
+                            import base64 as _b64
+                            b64 = 'data:image/jpeg;base64,' + _b64.b64encode(_fimg.read()).decode('utf-8')
+        except Exception:
+            b64 = None
+
+        # Fallback: fetch from GS via assignment
+        if not b64 and assignment and isinstance(assignment, dict):
+            try:
+                img_endpoint = None
+                if isinstance(assignment.get('image'), dict):
+                    img_endpoint = assignment.get('image').get('imageUrl') or assignment.get('image').get('localImageUrl')
+                if img_endpoint and getattr(self, 'mapper', None) and getattr(self.mapper, 'work_client', None):
+                    fetched = self.mapper.work_client.get_image(img_endpoint)
+                    if fetched is not None:
+                        buf = io.BytesIO()
+                        fetched.save(buf, format='JPEG')
+                        import base64 as _b64
+                        b64 = 'data:image/jpeg;base64,' + _b64.b64encode(buf.getvalue()).decode('utf-8')
+            except Exception:
+                b64 = None
+
+        # Build ImageMeta from assignment telemetry (best-effort)
+        meta = None
+        try:
+            lat = None; lon = None; alt = None; heading = 0.0
+            if assignment and isinstance(assignment, dict):
+                img = assignment.get('image') or {}
+                tel = img.get('telemetry') or img.get('meta') or {}
+                gps = tel.get('gps') or {}
+                lat = gps.get('latitude') or tel.get('latitude') or tel.get('lat')
+                lon = gps.get('longitude') or tel.get('longitude') or tel.get('lon')
+                alt = tel.get('altitude') or gps.get('altitude') or tel.get('alt')
+                heading = tel.get('yaw') or tel.get('planeYaw') or 0.0
+            if lat is not None and lon is not None:
+                meta = ImageMeta(location=GeoLocation(lat=float(lat), lon=float(lon), alt=float(alt or 0.0)), heading=float(heading))
+        except Exception:
+            meta = None
+
+        base_src = Base64Image(id=assignment.get('id') if isinstance(assignment, dict) else 0, base64_image=b64 or '', meta=meta, assignment=assignment)
+        bbox = []
+        if roi is not None:
+            try:
+                bbox = [int(roi.top_left[0]), int(roi.top_left[1]), int(roi.bottom_right[0]), int(roi.bottom_right[1])]
+            except Exception:
+                bbox = []
+        score = 0.0
+        try:
+            score = float(classification.label[1]) if classification is not None else 0.0
+        except Exception:
+            score = 0.0
+        cand = CandidateImage(bbox=bbox, score=score, source=base_src, label=LabelTypes.UNKNOWN)
+        return cand
+
+    def send_to_autopilot(self):
+        """Select best entries and POST payloads to the configured autopilot endpoint."""
+        if not self.autopilot_url:
+            print_yellow("[autopilot] Autopilot URL not configured; skipping send")
+            return
+
+        def _process_entry(entry, target_type_str):
+            if entry is None:
+                print_yellow(f"[autopilot] No {target_type_str} entry to send")
+                return
+            try:
+                assignment = entry[0]
+                roi = entry[1]
+                classification = entry[2]
+                meta_fn = entry[5] if len(entry) > 5 else None
+
+                cand = None
+                try:
+                    cand = self._build_candidate_from_entry(assignment, roi, classification, meta_filename=meta_fn)
+                except Exception as e:
+                    print_red(f"[autopilot] Failed to build candidate for projection: {e}")
+                    cand = None
+
+                lat = None; lon = None
+                if cand is not None:
+                    try:
+                        proj = self._projector.project(cand)
+                        if proj:
+                            lat = proj.lat
+                            lon = proj.lon
+                    except Exception as e:
+                        print_red(f"[autopilot] Projection error: {e}")
+
+                if lat is None or lon is None:
+                    print_red(f"[autopilot] Could not determine lat/lon for {target_type_str}; skipping send")
+                    return
+
+                payload = {
+                    "lat": float(lat),
+                    "lng": float(lon),
+                    "target_type": target_type_str,
+                    "id": int(self._autopilot_id),
+                }
+                print("PAYLOAD:", payload)
+                try:
+                    resp = requests.post(self.autopilot_url, json=payload, timeout=5)
+                    if 200 <= resp.status_code < 300:
+                        print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
+                        self._autopilot_id += 1
+                    else:
+                        print_red(f"[autopilot] Autopilot rejected payload (status={resp.status_code})")
+                except Exception as e:
+                    print_red(f"[autopilot] Failed to POST to autopilot: {e}")
+            except Exception as e:
+                print_red(f"[autopilot] Unexpected error processing entry: {e}")
+
+        try:
+            m_entry = self.result_store.get_mannequin() if self.result_store else None
+            if m_entry:
+                _process_entry(m_entry, "person")
+        except Exception:
+            pass
+
+        try:
+            t_entry = self.result_store.get_tent() if self.result_store else None
+            if t_entry:
+                _process_entry(t_entry, "tent")
+        except Exception:
+            pass
 
     def _cloud_poller_loop(self):
-        """Poll the cloud server for best tent/mannequin images and update result_store.
-
-        When the server returns a best image, update `result_store` so it will be
-        preferred over any cached GD backup. If the server returns nothing (204),
-        leave the existing store entries untouched so GD backup can be used.
-        """
+        """Deprecated: polling loop replaced by scheduler. Keep for compatibility."""
+        # Keep the old loop available but not used; new scheduler calls
+        # `_poll_cloud_once()` on its interval instead.
         while True:
             try:
-                # Mannequin
-                try:
-                    assign, roi, clf = self.work_client.get_mannequin_image()
-                    if assign is not None and roi is not None and clf is not None:
-                        try:
-                            # Persist ROI (and a surrogate full image) and write metadata
-                            try:
-                                ts = int(time.time() * 1000)
-                                label_name = 'mannequin'
-                                aid = assign.get('id') if assign else 'noid'
-                                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
-                                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
-                                # Save ROI crop as both roi and full (no full image available)
-                                try:
-                                    roi.roi.save(str(full_fn), format='JPEG')
-                                except Exception:
-                                    pass
-                                try:
-                                    roi.roi.save(str(roi_fn), format='JPEG')
-                                except Exception:
-                                    pass
-                                meta = {
-                                    "timestamp": ts,
-                                    "label": label_name,
-                                    "assignment_id": aid,
-                                    "assignment": assign,
-                                    "model_source": "cloud_pull",
-                                    "gemini_reason": None,
-                                    "score": float(clf.label[1]) if clf is not None else 0.0,
-                                    "full_image": str(full_fn.name),
-                                    "roi_image": str(roi_fn.name),
-                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
-                                    "pushed": True,
-                                }
-                                meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
-                                with open(meta_fn, 'w') as mf:
-                                    json.dump(meta, mf)
-                                mf_name = meta_fn.name
-                            except Exception:
-                                mf_name = None
-
-                            self.result_store.update(LabelType.MANNEQUIN, assign, roi, clf, "cloud_pull", None, mf_name)
-                            print_green("[poller] Updated mannequin from cloud pull")
-                        except Exception as e:
-                            print_red(f"[poller] Failed to update mannequin result_store: {e}")
-                except Exception as e:
-                    print_yellow(f"[poller] Mannequin pull error: {e}")
-
-                # Tent
-                try:
-                    assign, roi, clf = self.work_client.get_tent_image()
-                    if assign is not None and roi is not None and clf is not None:
-                        try:
-                            # Persist ROI/full surrogate and write metadata
-                            try:
-                                ts = int(time.time() * 1000)
-                                label_name = 'tent'
-                                aid = assign.get('id') if assign else 'noid'
-                                full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
-                                roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
-                                try:
-                                    roi.roi.save(str(full_fn), format='JPEG')
-                                except Exception:
-                                    pass
-                                try:
-                                    roi.roi.save(str(roi_fn), format='JPEG')
-                                except Exception:
-                                    pass
-                                meta = {
-                                    "timestamp": ts,
-                                    "label": label_name,
-                                    "assignment_id": aid,
-                                    "assignment": assign,
-                                    "model_source": "cloud_pull",
-                                    "gemini_reason": None,
-                                    "score": float(clf.label[1]) if clf is not None else 0.0,
-                                    "full_image": str(full_fn.name),
-                                    "roi_image": str(roi_fn.name),
-                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
-                                    "pushed": True,
-                                }
-                                meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
-                                with open(meta_fn, 'w') as mf:
-                                    json.dump(meta, mf)
-                                mf_name = meta_fn.name
-                            except Exception:
-                                mf_name = None
-
-                            self.result_store.update(LabelType.TENT, assign, roi, clf, "cloud_pull", None, mf_name)
-                            print_green("[poller] Updated tent from cloud pull")
-                        except Exception as e:
-                            print_red(f"[poller] Failed to update tent result_store: {e}")
-                except Exception as e:
-                    print_yellow(f"[poller] Tent pull error: {e}")
+                self._poll_cloud_once()
             except Exception as e:
                 print_yellow(f"[poller] Unexpected polling error: {e}")
             time.sleep(self.result_interval_seconds)
+
+    def _poll_cloud_once(self):
+        """Perform a single poll of the cloud for mannequin and tent best images.
+
+        This is extracted from the previous `_cloud_poller_loop` to allow the
+        scheduler to poll once and then proceed to send results to autopilot.
+        """
+        # Mannequin
+        try:
+            assign, roi, clf = self.work_client.get_mannequin_image()
+            if assign is not None and roi is not None and clf is not None:
+                # Detect duplicate: same assignment id, bbox, and confidence
+                try:
+                    aid = assign.get('id') if assign else 'noid'
+                    bbox = list(roi.top_left) + list(roi.bottom_right) if roi is not None else []
+                    score = float(clf.label[1]) if clf is not None else 0.0
+                    sig = (str(aid), tuple(bbox), round(float(score), 6))
+                except Exception:
+                    sig = None
+                is_dup = (sig is not None and sig in self._seen_cloud_signatures)
+                if is_dup:
+                    # Duplicate detected — notify frontend and skip updating result_store
+                    try:
+                        notify_sse('duplicate', {'label': 'mannequin', 'assignment_id': aid, 'bbox': bbox, 'score': score, 'message': 'duplicate detection — skipped autopilot send'})
+                    except Exception:
+                        pass
+                # proceed with persisting and recording only if not duplicate
+                if not is_dup:
+                    ts = int(time.time() * 1000)
+                    label_name = 'mannequin'
+                    aid = assign.get('id') if assign else 'noid'
+                    full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                    roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                    # Save ROI crop as both roi and full (no full image available)
+                    try:
+                        import os as _os
+                        import io as _io
+                        buf = _io.BytesIO()
+                        roi.roi.save(buf, format='JPEG')
+                        data = buf.getvalue()
+                        tmp_full = str(full_fn) + '.tmp'
+                        with open(tmp_full, 'wb') as _f:
+                            _f.write(data)
+                            _f.flush()
+                            _os.fsync(_f.fileno())
+                        _os.replace(tmp_full, str(full_fn))
+                    except Exception:
+                        pass
+                    try:
+                        import os as _os
+                        import io as _io
+                        buf2 = _io.BytesIO()
+                        roi.roi.save(buf2, format='JPEG')
+                        data2 = buf2.getvalue()
+                        tmp_roi = str(roi_fn) + '.tmp'
+                        with open(tmp_roi, 'wb') as _f2:
+                            _f2.write(data2)
+                            _f2.flush()
+                            _os.fsync(_f2.fileno())
+                        _os.replace(tmp_roi, str(roi_fn))
+                    except Exception:
+                        pass
+                    meta = {
+                        "timestamp": ts,
+                        "label": label_name,
+                        "assignment_id": aid,
+                        "assignment": assign,
+                        "model_source": "cloud_pull",
+                        "gemini_reason": None,
+                        "score": float(clf.label[1]) if clf is not None else 0.0,
+                        "full_image": str(full_fn.name),
+                        "roi_image": str(roi_fn.name),
+                        "bbox": list(roi.top_left) + list(roi.bottom_right),
+                        "pushed": True,
+                    }
+                    try:
+                        import os as _os
+                        meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                        tmp_meta = str(meta_fn) + '.tmp'
+                        with open(tmp_meta, 'w') as _mf:
+                            json.dump(meta, _mf)
+                            _mf.flush()
+                            _os.fsync(_mf.fileno())
+                        _os.replace(tmp_meta, str(meta_fn))
+                        mf_name = meta_fn.name
+                    except Exception:
+                        mf_name = None
+
+                    # Mark signature seen to avoid future duplicates
+                    try:
+                        if sig is not None:
+                            self._seen_cloud_signatures.add(sig)
+                    except Exception:
+                        pass
+
+                    try:
+                        # Update result store and notify frontend of the new cloud pull
+                        self.result_store.update(LabelType.MANNEQUIN, assign, roi, clf, "cloud_pull", None, mf_name)
+                        print_green("[poller] Updated mannequin from cloud pull")
+                        try:
+                            # small pause to ensure filesystem visibility after atomic rename
+                            time.sleep(0.05)
+                            notify_sse('gs_pull', {'label': 'mannequin', 'meta': mf_name})
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print_red(f"[poller] Failed to update mannequin result_store: {e}")
+        except Exception as e:
+            print_yellow(f"[poller] Mannequin pull error: {e}")
+
+        # Tent
+        try:
+            assign, roi, clf = self.work_client.get_tent_image()
+            if assign is not None and roi is not None and clf is not None:
+                # Duplicate detection for tent
+                try:
+                    aid = assign.get('id') if assign else 'noid'
+                    bbox = list(roi.top_left) + list(roi.bottom_right) if roi is not None else []
+                    score = float(clf.label[1]) if clf is not None else 0.0
+                    sig = (str(aid), tuple(bbox), round(float(score), 6))
+                except Exception:
+                    sig = None
+                is_dup = (sig is not None and sig in self._seen_cloud_signatures)
+                if is_dup:
+                    try:
+                        notify_sse('duplicate', {'label': 'tent', 'assignment_id': aid, 'bbox': bbox, 'score': score, 'message': 'duplicate detection — skipped autopilot send'})
+                    except Exception:
+                        pass
+                if not is_dup:
+                    try:
+                        ts = int(time.time() * 1000)
+                        label_name = 'tent'
+                        aid = assign.get('id') if assign else 'noid'
+                        full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
+                        roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                        try:
+                            import os as _os
+                            import io as _io
+                            buf = _io.BytesIO()
+                            roi.roi.save(buf, format='JPEG')
+                            data = buf.getvalue()
+                            tmp_full = str(full_fn) + '.tmp'
+                            with open(tmp_full, 'wb') as _f:
+                                _f.write(data)
+                                _f.flush()
+                                _os.fsync(_f.fileno())
+                            _os.replace(tmp_full, str(full_fn))
+                        except Exception:
+                            pass
+                        try:
+                            import os as _os
+                            import io as _io
+                            buf2 = _io.BytesIO()
+                            roi.roi.save(buf2, format='JPEG')
+                            data2 = buf2.getvalue()
+                            tmp_roi = str(roi_fn) + '.tmp'
+                            with open(tmp_roi, 'wb') as _f2:
+                                _f2.write(data2)
+                                _f2.flush()
+                                _os.fsync(_f2.fileno())
+                            _os.replace(tmp_roi, str(roi_fn))
+                        except Exception:
+                            pass
+                        try:
+                            import os as _os
+                            meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
+                            tmp_meta = str(meta_fn) + '.tmp'
+                            with open(tmp_meta, 'w') as _mf:
+                                json.dump({
+                                    "timestamp": ts,
+                                    "label": label_name,
+                                    "assignment_id": aid,
+                                    "assignment": assign,
+                                    "model_source": "cloud_pull",
+                                    "gemini_reason": None,
+                                    "score": float(clf.label[1]) if clf is not None else 0.0,
+                                    "full_image": str(full_fn.name),
+                                    "roi_image": str(roi_fn.name),
+                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
+                                    "pushed": True,
+                                }, _mf)
+                                _mf.flush()
+                                _os.fsync(_mf.fileno())
+                            _os.replace(tmp_meta, str(meta_fn))
+                            mf_name = meta_fn.name
+                        except Exception:
+                            mf_name = None
+                    except Exception:
+                        mf_name = None
+
+                    # mark signature and update store
+                    try:
+                        if sig is not None:
+                            self._seen_cloud_signatures.add(sig)
+                    except Exception:
+                        pass
+
+                    try:
+                        self.result_store.update(LabelType.TENT, assign, roi, clf, "cloud_pull", None, mf_name)
+                        print_green("[poller] Updated tent from cloud pull")
+                        try:
+                            # small pause to ensure filesystem visibility after atomic rename
+                            time.sleep(0.05)
+                            notify_sse('gs_pull', {'label': 'tent', 'meta': mf_name})
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print_red(f"[poller] Failed to update tent result_store: {e}")
+        except Exception as e:
+            print_yellow(f"[poller] Tent pull error: {e}")
 
     def run_task(self):
         print("\n[worker] Starting task cycle ========")
@@ -399,6 +689,7 @@ class VisionClient:
             image = self.work_client.get_image(metadata["endpoint"])
             break
         self.image = image
+        logger.info("Image received from GS — id=%s endpoint=%s", metadata.get('id'), metadata.get('endpoint'))
         self.mapper.mark_image_received()
 
         # Export the raw ground-station pull (no processing yet) to EXPORT_DIR
@@ -550,6 +841,13 @@ class VisionClient:
                     with open(meta_fn, "w") as mf:
                         import json
                         json.dump(meta, mf)
+                    mf_name = meta_fn.name
+                    try:
+                        # Update ResultStore with GD backup entry so it can be used when no cloud pull exists
+                        if getattr(self, 'result_store', None):
+                            self.result_store.update(LabelType.MANNEQUIN, self.assignment, roi, Classification(label=LabelType.MANNEQUIN, number_conf=float(best_mannequin.score)), 'gd_backup', None, mf_name)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except Exception:
@@ -595,6 +893,12 @@ class VisionClient:
                     with open(meta_fn, "w") as mf:
                         import json
                         json.dump(meta, mf)
+                    mf_name = meta_fn.name
+                    try:
+                        if getattr(self, 'result_store', None):
+                            self.result_store.update(LabelType.TENT, self.assignment, roi, Classification(label=LabelType.TENT, number_conf=float(best_tent.score)), 'gd_backup', None, mf_name)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except Exception:
@@ -603,54 +907,6 @@ class VisionClient:
             print_yellow("[gd_backup] No tent candidate found in current image")
 
 
-    # Send result of detection and classification to GS
-    def send_result(self):
-        def _send_with_log(target_name: str, assignment, roi, classification, source: str):
-            try:
-                response = self.work_client.send_adlc_output(assignment, roi, classification)
-                if 200 <= response.status_code < 300:
-                    print(
-                        f"[send_result] Sent {target_name} using {source} image (assignment_id={assignment.get('id')}, status={response.status_code})"
-                    )
-                else:
-                    print_red(
-                        f"[send_result] Failed to send {target_name} using {source} image (assignment_id={assignment.get('id')}, status={response.status_code})"
-                    )
-            except Exception as e:
-                print_red(f"[send_result] Exception while sending {target_name} using {source} image: {e}")
-
-        # Cloud-pushed results (via POST /api/result)
-        cloud_mannequin = self.result_store.get_mannequin()
-        cloud_tent = self.result_store.get_tent()
-
-        # Mannequin: prefer cloud-pushed result; fall back to GD backup
-        if cloud_mannequin is not None:
-            # tuple: (assignment, roi, classification, model_source, gemini_reason, meta_filename_opt)
-            m_assignment, m_roi, m_classification, m_model_source, m_gemini_reason, _ = cloud_mannequin
-            reason_str = f", gemini={m_gemini_reason!r}" if m_gemini_reason else ""
-            print(f"[send_result] mannequin source = cloud push (model={m_model_source}{reason_str})")
-            _send_with_log("mannequin", m_assignment, m_roi, m_classification, "cloud")
-        elif self._gd_best_mannequin is not None:
-            print_yellow("[send_result] mannequin source = cached (GD backup)")
-            gd_assign, gd_roi, gd_clf = self._gd_best_mannequin
-            _send_with_log("mannequin", gd_assign, gd_roi, gd_clf, "cached")
-        else:
-            print_red("[send_result] No mannequin candidate available to send")
-
-        # Tent: prefer cloud-pushed result; fall back to GD backup
-        if cloud_tent is not None:
-            # tuple: (assignment, roi, classification, model_source, gemini_reason, meta_filename_opt)
-            t_assignment, t_roi, t_classification, t_model_source, t_gemini_reason, _ = cloud_tent
-            reason_str = f", gemini={t_gemini_reason!r}" if t_gemini_reason else ""
-            print(f"[send_result] tent source = cloud push (model={t_model_source}{reason_str})")
-            _send_with_log("tent", t_assignment, t_roi, t_classification, "cloud")
-        elif self._gd_best_tent is not None:
-            print_yellow("[send_result] tent source = cached (GD backup)")
-            gd_assign, gd_roi, gd_clf = self._gd_best_tent
-            _send_with_log("tent", gd_assign, gd_roi, gd_clf, "cached")
-        else:
-            print_red("[send_result] No tent candidate available to send")
-        print("[send_result] DONE SENDING RESULTS ========= ")
 def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
     header(f"\n[mapping] Map HTTP server started on port {port}")
 
@@ -666,9 +922,9 @@ def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
     except Exception as e:
         print_red(f"Error in map HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, result_interval_seconds: float = 10.0):
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, autopilot_port: int = None, result_interval_seconds: float = 10.0):
     header("\n[worker] Starting worker loop")
-    worker = VisionClient(work_client, mapper, result_store, result_interval_seconds)
+    worker = VisionClient(work_client, mapper, result_store, autopilot_host, autopilot_port, result_interval_seconds)
     while True:
         try:
             worker.run_task()
@@ -697,12 +953,16 @@ def main(
     map_server_port: int = 8080,
     result_interval_seconds: float = 10.0,
     map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS,
+    autopilot_host: str = None,
+    autopilot_port: int = None,
     mapping_only: bool = False,
     enable_map_idle_trigger: bool = False,
 ):
+    log_path = _setup_file_logging()
+    logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
     header(
         f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
-        f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s"
+        f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s, autopilot={autopilot_host}:{autopilot_port}"
     )
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
@@ -746,7 +1006,7 @@ def main(
         print_yellow("[startup] Mapping-only mode enabled: worker loop disabled")
         while True:
             time.sleep(60)
-    worker_loop(work_client, mapper, result_store, result_interval_seconds)
+    worker_loop(work_client, mapper, result_store, autopilot_host, autopilot_port, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
@@ -773,6 +1033,8 @@ if __name__ == "__main__":
     parser.add_argument('--csip', type=str, default="34.106.160.143:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=20.0, help="Run send_result() every F seconds")
+    parser.add_argument('--autopilot-host', type=str, default=None, help="Autopilot host/IP to POST target payloads to")
+    parser.add_argument('--autopilot-port', type=int, default="8001", help="Autopilot port to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
     parser.add_argument('--mapping-only', action='store_true',
@@ -795,6 +1057,8 @@ if __name__ == "__main__":
         args.map_port,
         args.interval_seconds,
         args.map_idle_timeout,
+        args.autopilot_host,
+        args.autopilot_port,
         args.mapping_only,
         args.enable_map_idle_trigger,
     )
