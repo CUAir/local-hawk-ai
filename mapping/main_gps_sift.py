@@ -20,7 +20,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,6 +33,8 @@ import numpy as np
 # Keep OpenMP behavior consistent on macOS.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -39,6 +43,9 @@ from dji_dataextraction import process_folder as dji_process_folder, write_metad
 
 REFERENCE_ALTITUDE = 100.0  # meters — altitude-normalization baseline
 CSV_MIN_ALTITUDE_FT = 75.0
+PROCESSED_IMAGE_MAX_DIM = 1200
+PREPROCESS_MAX_WORKERS = max(1, min(8, os.cpu_count() or 4))
+CAMERA_HFOV_DEG = 76.0
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -130,13 +137,31 @@ def _rotate_image(image: np.ndarray, heading_deg: float) -> np.ndarray:
 
 
 def _resize_image(image: np.ndarray, altitude: float) -> np.ndarray:
-    """Scale image based on altitude relative to REFERENCE_ALTITUDE."""
+    """Scale by altitude, then cap dimensions to keep matching/warping bounded."""
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        return image
+
+    altitude_factor = 1.0
+    if altitude is not None and np.isfinite(altitude) and altitude > 0:
+        altitude_factor = altitude / REFERENCE_ALTITUDE
+
+    max_dim_factor = PROCESSED_IMAGE_MAX_DIM / float(max(h, w))
+    factor = min(altitude_factor, max_dim_factor)
+    if not np.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 1e-3:
+        return image
+    interpolation = cv2.INTER_AREA if factor < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(image, None, fx=factor, fy=factor, interpolation=interpolation)
+
+
+def _estimate_ppm(image: np.ndarray, altitude: float) -> Optional[float]:
+    """Estimate pixels-per-meter after preprocessing for GPS sanity checks."""
     if altitude is None or not np.isfinite(altitude) or altitude <= 0:
-        return image
-    factor = altitude / REFERENCE_ALTITUDE
-    if factor <= 0:
-        return image
-    return cv2.resize(image, None, fx=factor, fy=factor)
+        return None
+    ground_width_m = 2.0 * float(altitude) * np.tan(np.radians(CAMERA_HFOV_DEG / 2.0))
+    if not np.isfinite(ground_width_m) or ground_width_m <= 0:
+        return None
+    return float(max(image.shape[:2]) / ground_width_m)
 
 
 def _normalize_image(image: np.ndarray) -> np.ndarray:
@@ -148,6 +173,23 @@ def _normalize_image(image: np.ndarray) -> np.ndarray:
     l = clahe.apply(l)
     l = cv2.multiply(l, 0.75)  # avoid oversharpening after CLAHE
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def _preprocess_one(
+    args: Tuple[str, str, float, float, float, float]
+) -> Tuple[str, Optional[np.ndarray], Optional[Tuple[float, float]], Optional[float], Optional[str]]:
+    """Load + preprocess a single image; worker-safe for process pools."""
+    name, image_path, lat, lon, alt, heading = args
+    img = cv2.imread(image_path)
+    if img is None:
+        return name, None, None, None, "read_failed"
+    try:
+        img = _normalize_image(img)
+        img = _resize_image(img, alt)
+        img = _rotate_image(img, heading)
+        return name, img, (lat, lon), _estimate_ppm(img, alt), None
+    except Exception as exc:
+        return name, None, None, None, f"preprocess_failed: {exc}"
 
 
 class GpsSiftPipeline:
@@ -251,10 +293,13 @@ class GpsSiftPipeline:
         coordinates: List[Tuple[float, float]] = []
         skipped = 0
 
+        # Preserve CSV order so image 0, GPS reference, and placement sequence
+        # are deterministic across platforms and runs.
         image_files = [
-            f for f in os.listdir(folder)
-            if Path(f).suffix.lower() in self.IMAGE_EXTENSIONS
+            name for name in metadata
+            if Path(name).suffix.lower() in self.IMAGE_EXTENSIONS
         ]
+        preprocess_jobs: List[Tuple[str, str, float, float, float, float]] = []
         for name in image_files:
             if name not in metadata:
                 skipped += 1
@@ -263,17 +308,48 @@ class GpsSiftPipeline:
             if not path.exists():
                 skipped += 1
                 continue
-            img = cv2.imread(str(path))
-            if img is None:
-                self.logger.warning("Failed to load %s — skipping", name)
-                skipped += 1
-                continue
             lat, lon, alt, heading = metadata[name]
-            img = _normalize_image(img)
-            img = _resize_image(img, alt)
-            img = _rotate_image(img, heading)
-            images.append(img)
-            coordinates.append((lat, lon))
+            preprocess_jobs.append((name, str(path), lat, lon, alt, heading))
+
+        if not preprocess_jobs:
+            raise ValueError("No valid images found with matching metadata")
+
+        # Multiprocessing speeds up heavy per-image preprocessing for batch CLI runs.
+        # For server-triggered mapping (runs in a background thread), stay on threads
+        # to avoid macOS multiprocessing issues when forking from non-main threads.
+        use_process_pool = (
+            len(preprocess_jobs) >= 8
+            and threading.current_thread() is threading.main_thread()
+        )
+        if use_process_pool:
+            executor_cls = ProcessPoolExecutor
+            workers = min(PREPROCESS_MAX_WORKERS, len(preprocess_jobs))
+            mode = "multiprocessing"
+        else:
+            executor_cls = ThreadPoolExecutor
+            workers = min(4, len(preprocess_jobs))
+            mode = "threaded"
+
+        self.logger.info(
+            "Pre-processing %d image(s) using %s (%d workers)",
+            len(preprocess_jobs),
+            mode,
+            workers,
+        )
+        ppm_samples: List[float] = []
+        with executor_cls(max_workers=workers) as executor:
+            for name, img, coord, ppm_sample, error in executor.map(_preprocess_one, preprocess_jobs):
+                if img is None or coord is None:
+                    skipped += 1
+                    if error == "read_failed":
+                        self.logger.warning("Failed to load %s — skipping", name)
+                    else:
+                        self.logger.warning("Failed to preprocess %s — skipping (%s)", name, error)
+                    continue
+                images.append(img)
+                coordinates.append(coord)
+                if ppm_sample is not None and np.isfinite(ppm_sample) and ppm_sample > 0:
+                    ppm_samples.append(float(ppm_sample))
 
         if not images:
             raise ValueError("No valid images found with matching metadata")
@@ -287,7 +363,9 @@ class GpsSiftPipeline:
 
         # --- Stitch ---
         t_stitch = time.time()
-        canvas, placed_indices, _ = stitch_geolocated_images(images, coordinates)
+        ppm = float(np.median(ppm_samples)) if ppm_samples else 30.0
+        self.logger.info("Using estimated PPM=%.2f from %d image(s)", ppm, len(ppm_samples))
+        canvas, placed_indices, _ = stitch_geolocated_images(images, coordinates, ppm=ppm)
         elapsed_stitch = time.time() - t_stitch
 
         if canvas is None:
@@ -309,7 +387,9 @@ class GpsSiftPipeline:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             out_path = str(self.output_dir / filename)
         else:
-            out_path = str(Path(__file__).parent / filename)
+            test_output_dir = Path(__file__).parent / "test_outputs"
+            test_output_dir.mkdir(parents=True, exist_ok=True)
+            out_path = str(test_output_dir / filename)
 
         cv2.imwrite(out_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 92])
         self.logger.info("Saved → %s  (total %.1fs)", out_path, time.time() - t0)
@@ -330,7 +410,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output directory for the result JPEG (default: mapping/ folder)",
+        help="Output directory for the result JPEG (default: mapping/test_outputs)",
     )
     parser.add_argument(
         "--test-type",

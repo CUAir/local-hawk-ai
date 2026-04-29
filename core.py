@@ -82,7 +82,7 @@ MAX_BOX_FRACTION = 0.5
 
 # Mapping pipeline constants (mirrors hawk-ai/main.py)
 MAPPING_SESSION_DIR = Path(__file__).parent / "mapping" / "current_session"
-MAPPING_OUTPUT_DIR  = Path(__file__).parent / "mapping"
+MAPPING_OUTPUT_DIR  = Path(__file__).parent / "mapping" / "outputs"
 MAPPING_CSV_PATH    = MAPPING_SESSION_DIR / "metadata.csv"
 IDLE_MAPPING_TIMEOUT_SECONDS = 20
 IDLE_MAPPING_POLL_SECONDS = 1

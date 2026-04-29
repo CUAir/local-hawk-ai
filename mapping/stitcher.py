@@ -4,12 +4,15 @@ import gc
 from typing import List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor
 
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
+
 MAX_CANVAS_DIM = 10000
 NEIGHBOR_RADIUS_M = 150.0
 MAX_ANCHORS = 8
 RATIO_TEST = 0.75         # Lowe's recommended threshold; tighter reduces false matches in repetitive terrain
 RANSAC_REPROJ = 6.0
-SIFT_FEATURES = 8000
+SIFT_FEATURES = 6000
 SIFT_CONTRAST = 0.005
 CLAHE_CLIP = 2.0
 CLAHE_TILE = 8
@@ -25,15 +28,22 @@ MIN_PLACEMENT_INLIERS = 25        # Minimum RANSAC inliers for passes 2+ (lenien
 MIN_PLACEMENT_INLIERS_PASS1 = 50  # Stricter floor for pass 1 (sparse anchor graph = higher bad-seed risk)
 
 PREVIEW_EVERY = 25
-REFINE_MAX_ITERS = 200
+REFINE_MAX_ITERS = 40
 REFINE_STEP = 0.3         # Larger step works now that initial poses are similarity transforms
 REFINE_EARLY_STOP = 1e-5
-LAPLACIAN_LEVELS = 7
+LAPLACIAN_LEVELS = 5
 BLEND_MEM_BUDGET = 2.0 * 1024 ** 3   # 2 GB cap for float32 Laplacian accumulator
 NUM_WORKERS = 4           # Parallel workers for feature extraction and warping
 GAIN_COMPENSATION = True  # Normalize per-image brightness before blending
-GAIN_CLIP = (0.5, 2.0)    # Clamp gain to avoid over-correction on outlier exposures
-VORONOI_FEATHER_SIGMA = 10  # 0 = hard Voronoi (binary weights); >0 = Gaussian feather radius in output pixels
+GAIN_CLIP = (0.7, 1.4)    # Clamp gain to avoid over-correction on outlier exposures
+GAIN_SCALE = 0.25         # Downsample factor for gain compensator feed
+VORONOI_FEATHER_SIGMA = 5  # 0 = hard Voronoi (binary weights); >0 = Gaussian feather radius in output pixels
+ENABLE_BRIDGE_MATCHING = True
+HARSH_BREAK_MAX_PASSES = 5
+HARSH_BREAK_MIN_BOUNDARY_PX = 50
+HARSH_BREAK_SSIM_THRESH = 0.25
+HARSH_BREAK_DIFF_THRESH = 50.0
+HARSH_BREAK_MIN_OVERLAP_FRAC = 0.10
 
 
 def _map_radians(deg):
@@ -87,6 +97,39 @@ def _grid_candidates(grid, pos, cell_size):
             yield from grid.get((cx + dx, cy + dy), [])
 
 
+def _connected_components(nodes, adj):
+    """Return connected components, largest first; prefer component containing 0 on ties."""
+    remaining = set(nodes)
+    components = []
+    while remaining:
+        start = next(iter(remaining))
+        comp = []
+        stack = [start]
+        remaining.remove(start)
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for nb in adj.get(node, set()):
+                if nb in remaining:
+                    remaining.remove(nb)
+                    stack.append(nb)
+        components.append(sorted(comp))
+    components.sort(key=lambda comp: (len(comp), 0 in comp), reverse=True)
+    return components
+
+
+def _remove_indices(placed_indices, placed_info, indices, reason):
+    """Remove indices from final assembly bookkeeping."""
+    to_remove = [idx for idx in indices if idx in placed_info]
+    if not to_remove:
+        return
+    print(f"  Removing {len(to_remove)} image(s) ({reason}): {sorted(to_remove)}")
+    remove_set = set(to_remove)
+    placed_indices[:] = [idx for idx in placed_indices if idx not in remove_set]
+    for idx in remove_set:
+        placed_info.pop(idx, None)
+
+
 def _extract_one(args):
     """Extract SIFT(primary) + AKAZE(fallback) features for one image."""
     i, img = args
@@ -107,7 +150,8 @@ def _extract_one(args):
 def stitch_geolocated_images(images: List[np.ndarray],
                               coordinates: List[Tuple[float, float]],
                               match_threshold: int = 10,
-                              skip_assembly: bool = False):
+                              skip_assembly: bool = False,
+                              ppm: float = 30.0):
     """
     GPS-guided SIFT stitcher using full 8-DOF homography, Voronoi seam
     finding, and Laplacian pyramid blending.
@@ -118,7 +162,8 @@ def stitch_geolocated_images(images: List[np.ndarray],
         return None, [], {}
 
     num_images = len(images)
-    PPM = 30.0
+    PPM = float(ppm) if np.isfinite(ppm) and ppm > 0 else 30.0
+    print(f"Using PPM={PPM:.2f} for GPS constraints")
     ref_lat = coordinates[0][0]
 
     # Convert GPS coords to metric offsets from first image
@@ -464,40 +509,33 @@ def stitch_geolocated_images(images: List[np.ndarray],
             adj[a].add(b)
             adj[b].add(a)
 
-    # BFS from image 0 to find main component
-    main_comp = set()
-    queue = [placed_indices[0]]
-    while queue:
-        node = queue.pop()
-        if node in main_comp:
-            continue
-        main_comp.add(node)
-        for nb in adj.get(node, set()):
-            if nb not in main_comp:
-                queue.append(nb)
+    components = _connected_components(placed_indices, adj)
+    main_comp = set(components[0]) if components else set()
+    if components:
+        print(
+            "Connectivity components: "
+            + ", ".join(f"{len(comp)}:{comp}" for comp in components)
+        )
+        if 0 not in main_comp:
+            print(
+                f"  Main component selected by size does not contain image 0; "
+                f"image 0 component size={next((len(c) for c in components if 0 in c), 0)}"
+            )
 
     secondary_all = [i for i in placed_indices if i not in main_comp]
+    unresolved_secondary_components = []
+    if not ENABLE_BRIDGE_MATCHING:
+        if secondary_all:
+            print(
+                f"Bridge matching disabled: keeping {len(secondary_all)} image(s) "
+                "outside main component for harsh-break filtering."
+            )
+        secondary_all = []
     if secondary_all:
         print(f"Bridge matching: {len(secondary_all)} images outside main component...")
-        # Group secondary images into sub-components via BFS
-        sec_visited = set()
-        sec_components = []
-        for start in secondary_all:
-            if start in sec_visited:
-                continue
-            comp = []
-            q = [start]
-            sec_visited.add(start)
-            while q:
-                node = q.pop()
-                comp.append(node)
-                for nb in adj.get(node, set()):
-                    if nb not in sec_visited:
-                        sec_visited.add(nb)
-                        q.append(nb)
-            sec_components.append(comp)
+        sec_components = [comp for comp in components if not set(comp).issubset(main_comp)]
 
-        BRIDGE_RADIUS_PX = NEIGHBOR_RADIUS_M * PPM * 3
+        BRIDGE_RADIUS_M = NEIGHBOR_RADIUS_M * 3.0
         BRIDGE_MIN_INLIERS = 20
         BRIDGE_MAX_SCALE_C = 3.0   # reject bridges requiring >3x scale correction
 
@@ -508,11 +546,24 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 for a in main_comp:
                     dist = np.hypot(positions[b][0] - positions[a][0],
                                     positions[b][1] - positions[a][1])
-                    if dist < BRIDGE_RADIUS_PX:
+                    if dist < BRIDGE_RADIUS_M:
                         bridge_candidates.append((a, b, dist))
             bridge_candidates.sort(key=lambda x: x[2])
+            print(
+                f"  Secondary component {comp_idx}: size={len(sec_comp)}, "
+                f"images={sec_comp}, bridge candidates={len(bridge_candidates)}"
+            )
 
             bridge_found = False
+            reject_counts = {
+                "no_descriptors": 0,
+                "few_matches": 0,
+                "few_inliers": 0,
+                "bad_area": 0,
+                "singular": 0,
+                "bad_scale": 0,
+            }
+            best_attempt = None
             for a, b, _ in bridge_candidates[:30]:
                 kp_s_a, des_s_a, kp_a_a, des_a_a = img_features[a]
                 kp_s_b, des_s_b, kp_a_b, des_a_b = img_features[b]
@@ -528,6 +579,12 @@ def stitch_geolocated_images(images: List[np.ndarray],
                     good = [m for m, n in matches if m.distance < AKAZE_RATIO_TEST * n.distance]
                     use_akaze = True
                 if len(good) < BRIDGE_MIN_INLIERS:
+                    if des_s_a is None or des_s_b is None:
+                        reject_counts["no_descriptors"] += 1
+                    else:
+                        reject_counts["few_matches"] += 1
+                    if best_attempt is None or len(good) > best_attempt[0]:
+                        best_attempt = (len(good), a, b, 0, None)
                     continue
 
                 if use_akaze:
@@ -539,12 +596,17 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 M_sim, mask = cv2.estimateAffinePartial2D(
                     src_pts, dst_pts, method=cv2.RANSAC,
                     ransacReprojThreshold=RANSAC_REPROJ)
-                if M_sim is None or mask is None or mask.sum() < BRIDGE_MIN_INLIERS:
+                inliers = int(mask.sum()) if mask is not None else 0
+                if best_attempt is None or len(good) > best_attempt[0] or inliers > best_attempt[3]:
+                    best_attempt = (len(good), a, b, inliers, "AKAZE" if use_akaze else "SIFT")
+                if M_sim is None or mask is None or inliers < BRIDGE_MIN_INLIERS:
+                    reject_counts["few_inliers"] += 1
                     continue
                 H_rel = np.vstack([M_sim, [0, 0, 1]])
                 h_b, w_b = images[b].shape[:2]
                 # Wider area ratio — bridge may span large scale difference
                 if not (0.1 < _homography_area_ratio(H_rel, w_b, h_b) < 10.0):
+                    reject_counts["bad_area"] += 1
                     continue
                 # C maps secondary component into main:
                 # new_H_b = H_a · H_rel ; C = new_H_b · inv(old_H_b)
@@ -557,6 +619,7 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 try:
                     C = new_H_b.dot(np.linalg.inv(old_H_b))
                 except np.linalg.LinAlgError:
+                    reject_counts["singular"] += 1
                     continue
                 C[2, 0] = 0.0
                 C[2, 1] = 0.0
@@ -566,9 +629,10 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 # Reject bridges requiring an implausible scale correction —
                 # scale_C >> 1 means the images don't actually overlap.
                 if not (1.0 / BRIDGE_MAX_SCALE_C < scale_C < BRIDGE_MAX_SCALE_C):
+                    reject_counts["bad_scale"] += 1
                     continue
                 print(f"  Bridge (comp {comp_idx}): img {b} -> img {a}, "
-                      f"inliers={int(mask.sum())}, scale_C={scale_C:.3f}")
+                      f"inliers={inliers}, scale_C={scale_C:.3f}")
                 main_comp.update(sec_set)
                 for i in sec_comp:
                     H_new = C.dot(placed_info[i]["H"])
@@ -583,6 +647,32 @@ def stitch_geolocated_images(images: List[np.ndarray],
             if not bridge_found:
                 print(f"  No bridge for secondary component {comp_idx} "
                       f"({len(sec_comp)} images)")
+                print(f"    Bridge reject summary: {reject_counts}")
+                if best_attempt is not None:
+                    good_n, a, b, inliers, method = best_attempt
+                    print(
+                        f"    Best bridge attempt: img {b} -> img {a}, "
+                        f"method={method}, matches={good_n}, inliers={inliers}"
+                    )
+                unresolved_secondary_components.append(sec_comp)
+
+    # Remove GPS-fallback artifacts using a harsh-break detector instead of
+    # forcing explicit bridge connections across disconnected components.
+    unresolved_secondary = [
+        idx for comp in unresolved_secondary_components for idx in comp
+    ]
+    _apply_harsh_break_removal(
+        images, placed_indices, placed_info,
+        extra_indices=unresolved_secondary,
+        remove_extra_on_insufficient_overlap=True,
+    )
+    for comp in unresolved_secondary_components:
+        remaining = [idx for idx in comp if idx in placed_indices]
+        if remaining:
+            _remove_indices(
+                placed_indices, placed_info, remaining,
+                "unresolved secondary component"
+            )
 
     # Remove oblique GPS fallbacks
     ROT_DELETE_DEG = 12.0
@@ -691,6 +781,171 @@ def compute_seam_ssim(images, placed_indices, placed_info, positions, sample_pai
             print(f"  imgs {i}↔{j}: SSIM={ssim_val:.3f}")
 
 
+def _compute_canvas_transform(images, placed_indices, placed_info):
+    """Compute canvas transform used for overlap checks."""
+    all_pts = []
+    for idx in placed_indices:
+        h, w = images[idx].shape[:2]
+        pts = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
+        all_pts.append(cv2.perspectiveTransform(pts, placed_info[idx]["H"]))
+    all_pts = np.concatenate(all_pts, axis=0)
+    all_pts = all_pts[np.isfinite(all_pts).all(axis=2).squeeze()]
+    if len(all_pts) == 0:
+        return None
+
+    xmin, ymin = np.int32(np.clip(all_pts.min(axis=0).ravel() - 0.5, -1e7, 1e7))
+    xmax, ymax = np.int32(np.clip(all_pts.max(axis=0).ravel() + 0.5, -1e7, 1e7))
+    raw_w = int(xmax - xmin)
+    raw_h = int(ymax - ymin)
+    if raw_w <= 0 or raw_h <= 0:
+        return None
+
+    scale = min(1.0, MAX_CANVAS_DIM / raw_w, MAX_CANVAS_DIM / raw_h)
+    canvas_w = max(1, int(raw_w * scale))
+    canvas_h = max(1, int(raw_h * scale))
+    T = np.array(
+        [[scale, 0, -xmin * scale], [0, scale, -ymin * scale], [0, 0, 1]],
+        dtype=np.float64,
+    )
+    return T, canvas_w, canvas_h
+
+
+def _apply_harsh_break_removal(
+    images,
+    placed_indices,
+    placed_info,
+    extra_indices=None,
+    remove_extra_on_insufficient_overlap=False,
+):
+    """Remove GPS fallbacks and unresolved component images that disagree with background."""
+    if not placed_indices:
+        return
+
+    extra_indices = set(extra_indices or [])
+    for pass_num in range(1, HARSH_BREAK_MAX_PASSES + 1):
+        candidates = []
+        seen = set()
+        for idx in placed_indices:
+            if placed_info.get(idx, {}).get("gps_fallback", False):
+                candidates.append((idx, "GPS", False))
+                seen.add(idx)
+        for idx in placed_indices:
+            if idx in extra_indices and idx not in seen:
+                candidates.append((idx, "secondary", bool(remove_extra_on_insufficient_overlap)))
+                seen.add(idx)
+
+        if not candidates:
+            print("Harsh-break: no GPS-fallback or unresolved secondary images remain.")
+            return
+
+        transform = _compute_canvas_transform(images, placed_indices, placed_info)
+        if transform is None:
+            return
+        T, canvas_w, canvas_h = transform
+
+        # Build background from non-GPS placements only.
+        bg_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+        bg_mask = np.zeros((canvas_h, canvas_w), dtype=bool)
+        candidate_set = {idx for idx, _, _ in candidates}
+        for idx in placed_indices:
+            if idx in candidate_set:
+                continue
+            H_canvas = T.dot(placed_info[idx]["H"])
+            warped = cv2.warpPerspective(
+                images[idx], H_canvas, (canvas_w, canvas_h),
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            warped_f = warped.astype(np.float32)
+            new_mask = np.any(warped > 10, axis=2)
+            overlap = bg_mask & new_mask
+            new_only = new_mask & ~bg_mask
+            if np.any(overlap):
+                bg_canvas[overlap] = warped_f[overlap]
+            if np.any(new_only):
+                bg_canvas[new_only] = warped_f[new_only]
+            bg_mask |= new_mask
+        bg_gray = cv2.cvtColor(
+            np.clip(bg_canvas, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32)
+
+        to_remove = []
+        print(
+            f"Harsh-break pass {pass_num}: checking {len(candidates)} candidate image(s)..."
+        )
+        for idx, label, remove_on_insufficient in candidates:
+            H_canvas = T.dot(placed_info[idx]["H"])
+            warped = cv2.warpPerspective(
+                images[idx], H_canvas, (canvas_w, canvas_h),
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            warped_mask = np.any(warped > 10, axis=2)
+            n_image = int(np.sum(warped_mask))
+            if n_image == 0:
+                continue
+
+            overlap = warped_mask & bg_mask
+            n_overlap = int(np.sum(overlap))
+            overlap_frac = n_overlap / max(1, n_image)
+            if (
+                overlap_frac < HARSH_BREAK_MIN_OVERLAP_FRAC
+                or n_overlap < HARSH_BREAK_MIN_BOUNDARY_PX
+            ):
+                action = "REMOVE" if remove_on_insufficient else "keeping"
+                print(
+                    f"  Image {idx} [{label}]: insufficient overlap "
+                    f"({overlap_frac:.0%}) -> {action}."
+                )
+                if remove_on_insufficient:
+                    to_remove.append(idx)
+                continue
+
+            warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            mean_diff = float(np.mean(np.abs(warped_gray[overlap] - bg_gray[overlap])))
+
+            img_region = warped_gray.copy()
+            bg_region = bg_gray.copy()
+            img_region[~overlap] = 0
+            bg_region[~overlap] = 0
+            ksize, sigma = (11, 11), 1.5
+            mu1 = cv2.GaussianBlur(img_region, ksize, sigma)
+            mu2 = cv2.GaussianBlur(bg_region, ksize, sigma)
+            mu1_sq = mu1 * mu1
+            mu2_sq = mu2 * mu2
+            mu1_mu2 = mu1 * mu2
+            sigma1_sq = cv2.GaussianBlur(img_region * img_region, ksize, sigma) - mu1_sq
+            sigma2_sq = cv2.GaussianBlur(bg_region * bg_region, ksize, sigma) - mu2_sq
+            sigma12 = cv2.GaussianBlur(img_region * bg_region, ksize, sigma) - mu1_mu2
+            c1 = (0.01 * 255.0) ** 2
+            c2 = (0.03 * 255.0) ** 2
+            ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+                (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-12
+            )
+            ssim_val = float(np.mean(ssim_map[overlap]))
+
+            is_bad = (
+                ssim_val < HARSH_BREAK_SSIM_THRESH
+                or mean_diff > HARSH_BREAK_DIFF_THRESH
+            )
+            status = "REMOVE" if is_bad else "ok"
+            print(
+                f"  Image {idx} [{label}]: overlap={overlap_frac:.0%}, "
+                f"diff={mean_diff:.1f}, ssim={ssim_val:.3f} -> {status}"
+            )
+            if is_bad:
+                to_remove.append(idx)
+
+        if not to_remove:
+            print("Harsh-break: no additional GPS-fallback removals needed.")
+            return
+
+        for idx in to_remove:
+            if idx in placed_indices:
+                placed_indices.remove(idx)
+            placed_info.pop(idx, None)
+            extra_indices.discard(idx)
+        print(f"Harsh-break: removed {len(to_remove)} image(s): {to_remove}")
+
+
 # ---------------------------------------------------------------------------
 # Assembly: Voronoi seam finding + Laplacian pyramid blending
 # ---------------------------------------------------------------------------
@@ -703,6 +958,100 @@ def _warp_and_dist(args):
     mask = np.any(warped > 10, axis=2).astype(np.uint8)
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     return dist  # return dist only; warped is re-computed in phase 2
+
+
+def _warp_at_scale(args):
+    """Warp an image + mask at a downsampled canvas scale, returning a cropped patch."""
+    img, H_canvas, out_w, out_h, scale = args
+    S = np.diag([scale, scale, 1.0])
+    H_scaled = S.dot(H_canvas)
+    warped = cv2.warpPerspective(
+        img, H_scaled, (out_w, out_h),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    mask = np.any(warped > 5, axis=2).astype(np.uint8) * 255
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None, None, None
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    return warped[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def _compute_overlap_gains(images, placed_indices, H_canvases,
+                           canvas_w, canvas_h, gain_scale=GAIN_SCALE):
+    """
+    Compute per-image exposure gains from actual overlap geometry.
+
+    Whole-image brightness is misleading for fields/roads because content differs
+    image-to-image; OpenCV's gain compensator estimates gains from warped overlap
+    regions, then we clamp to prevent visible over-correction.
+    """
+    n = len(placed_indices)
+    fallback_gains = np.ones(n, dtype=np.float32)
+
+    try:
+        gain_w = max(1, int(canvas_w * gain_scale))
+        gain_h = max(1, int(canvas_h * gain_scale))
+        warp_args = [
+            (images[idx], H_canvases[i], gain_w, gain_h, gain_scale)
+            for i, idx in enumerate(placed_indices)
+        ]
+        warps, masks, regions = [], [], []
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            for warped, mask, region in executor.map(_warp_at_scale, warp_args):
+                warps.append(warped)
+                masks.append(mask)
+                regions.append(region)
+
+        valid_ks = [k for k, warped in enumerate(warps) if warped is not None]
+        if len(valid_ks) < 2:
+            return fallback_gains
+
+        src_list = [warps[k].astype(np.uint8) for k in valid_ks]
+        mask_list = [masks[k] for k in valid_ks]
+        corners = [(int(regions[k][0]), int(regions[k][1])) for k in valid_ks]
+
+        try:
+            compensator = cv2.detail.GainCompensator(1)
+        except (AttributeError, TypeError):
+            compensator = cv2.detail_GainCompensator(1)
+
+        compensator.feed(
+            corners,
+            [cv2.UMat(src) for src in src_list],
+            [cv2.UMat(mask) for mask in mask_list],
+        )
+
+        raw_gains = None
+        try:
+            raw_gains = np.asarray(compensator.gains(), dtype=np.float32).flatten()
+        except (AttributeError, cv2.error, TypeError):
+            raw_gains = None
+
+        if raw_gains is None or len(raw_gains) != len(valid_ks):
+            # Some OpenCV builds do not expose gains(); infer through apply().
+            raw_gains = np.ones(len(valid_ks), dtype=np.float32)
+            probe_base = 128
+            for local_k, _orig_k in enumerate(valid_ks):
+                probe = np.full((4, 4, 3), probe_base, dtype=np.uint8)
+                probe_mask = np.full((4, 4), 255, dtype=np.uint8)
+                try:
+                    compensator.apply(local_k, corners[local_k], probe, probe_mask)
+                    raw_gains[local_k] = float(np.mean(probe[:, :, 0])) / float(probe_base)
+                except (cv2.error, Exception):
+                    raw_gains[local_k] = 1.0
+
+        gains = np.ones(n, dtype=np.float32)
+        for local_k, orig_k in enumerate(valid_ks):
+            gain = float(raw_gains[local_k])
+            if not np.isfinite(gain) or gain <= 0:
+                gain = 1.0
+            gains[orig_k] = float(np.clip(gain, GAIN_CLIP[0], GAIN_CLIP[1]))
+        return gains
+    except Exception as exc:
+        print(f"  GainCompensator failed ({exc}); leaving gains at 1.0.")
+        return fallback_gains
 
 
 def _assemble_blended_map(images, placed_indices, placed_info):
@@ -765,18 +1114,16 @@ def _assemble_blended_map(images, placed_indices, placed_info):
             label_map[update] = i
     del dist_map
 
-    # --- Gain compensation: normalize per-image brightness to global median ---
+    # --- Gain compensation: estimate exposure correction from actual overlaps ---
     gains = np.ones(len(placed_indices), dtype=np.float32)
     if GAIN_COMPENSATION:
-        brightnesses = []
-        for idx in placed_indices:
-            b = float(np.mean(images[idx].astype(np.float32)))
-            brightnesses.append(b)
-        target_brightness = float(np.median(brightnesses))
-        for k, b in enumerate(brightnesses):
-            if b > 1.0:
-                gains[k] = float(np.clip(target_brightness / b,
-                                         GAIN_CLIP[0], GAIN_CLIP[1]))
+        print(f"Computing overlap-based gain compensation (scale={GAIN_SCALE})...")
+        gains = _compute_overlap_gains(
+            images, placed_indices, H_canvases, canvas_w, canvas_h, GAIN_SCALE
+        )
+        print(
+            f"  Gains range {float(gains.min()):.3f}..{float(gains.max()):.3f}"
+        )
 
     # --- Phase 2: Laplacian pyramid blend (streaming accumulator) ---
     print(f"Building {LAPLACIAN_LEVELS}-level Laplacian pyramid accumulator...")
