@@ -389,14 +389,22 @@ class VisionClient:
                 }
                 print("PAYLOAD:", payload)
                 try:
-                    resp = requests.post(self.autopilot_url, json=payload, timeout=5)
-                    if 200 <= resp.status_code < 300:
-                        print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
-                        self._autopilot_id += 1
-                    else:
-                        print_red(f"[autopilot] Autopilot rejected payload (status={resp.status_code})")
+                    # Use WorkClient's retry helper for autopilot POSTs to benefit from same retry/backoff logic
+                    resp = None
+                    try:
+                        resp = self.work_client._do_request_with_retries('post', self.autopilot_url, json=payload, timeout=5)
+                    except Exception as e:
+                        print_red(f"[autopilot] Failed to POST to autopilot after retries: {e}")
+                        resp = None
+
+                    if resp is not None:
+                        if 200 <= resp.status_code < 300:
+                            print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
+                            self._autopilot_id += 1
+                        else:
+                            print_red(f"[autopilot] Autopilot rejected payload (status={resp.status_code})")
                 except Exception as e:
-                    print_red(f"[autopilot] Failed to POST to autopilot: {e}")
+                    print_red(f"[autopilot] Unexpected error posting to autopilot: {e}")
             except Exception as e:
                 print_red(f"[autopilot] Unexpected error processing entry: {e}")
 
@@ -979,8 +987,8 @@ if __name__ == "__main__":
     parser.add_argument('--csip', type=str, default="34.106.160.143:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=20.0, help="Run send_result() every F seconds")
-    parser.add_argument('--autopilot-host', type=str, default=None, help="Autopilot host/IP to POST target payloads to")
-    parser.add_argument('--autopilot-port', type=int, default="8001", help="Autopilot port to POST target payloads to")
+    parser.add_argument('--autopilot-ip', type=str, default=None, help="Autopilot host/IP to POST target payloads to")
+    parser.add_argument('--autopilot-port', type=int, default=8001, help="Autopilot port to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
 
@@ -993,4 +1001,4 @@ if __name__ == "__main__":
         gs_ip_address = args.gsip
         cs_ip_address = args.csip
 
-    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_seconds, args.map_idle_timeout, args.autopilot_host, args.autopilot_port)
+    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_seconds, args.map_idle_timeout, args.autopilot_ip, args.autopilot_port)
