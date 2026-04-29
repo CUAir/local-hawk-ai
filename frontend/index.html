@@ -17,7 +17,8 @@
     .log { max-height: 80vh; overflow:auto; padding-right:8px }
     .bbox { position:relative }
     canvas.entry-canvas { width:100%; height:auto; display:block }
-    .gs-column { flex: 0 0 360px; }
+    .results-section { flex: 1; display:flex; gap:24px; }
+    .gs-column { flex: 1; }
     .gs-card { border:1px solid #ddd; padding:12px; border-radius:6px; background:#fafafa }
     .notify { background:#fff8e1; border-left:4px solid #f0ad4e; padding:8px; margin-bottom:8px }
     .notify small { color:#666; display:block }
@@ -31,16 +32,32 @@
   <p>Shows the most recent saved result for each label (tent, mannequin). Images may come from cloud push or local GD backup.</p>
   <div id="notifications"></div>
   <div class="container">
-    <div class="column">
-      <div class="label">Tent</div>
-      <div class="log" id="log-tent"></div>
+    <div class="results-section">
+      <div class="column">
+        <div class="label">Tent</div>
+        <div class="log" id="log-tent"></div>
+      </div>
+      <div class="column">
+          <div class="label">Mannequin</div>
+          <div class="log" id="log-mannequin"></div>
+      </div>
     </div>
-    <div class="column">
-        <div class="label">Mannequin</div>
-        <div class="log" id="log-mannequin"></div>
-    </div>
-    <div class="column gs-column">
+    <div class="gs-column">
       <div class="label">Latest GS Pull</div>
+      <div style="margin-bottom:10px; font-size:13px; color:#444; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <span>Grid spacing</span>
+        <select id="gs-grid-spacing" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
+          <option value="5">5 m</option>
+          <option value="10" selected>10 m</option>
+          <option value="25">25 m</option>
+          <option value="50">50 m</option>
+          <option value="100">100 m</option>
+        </select>
+        <label style="display:flex; align-items:center; gap:6px; user-select:none;">
+          <input id="gs-show-crosshair" type="checkbox" checked />
+          <span>Show center crosshair</span>
+        </label>
+      </div>
       <div id="gs-panel"></div>
     </div>
   </div>
@@ -74,6 +91,90 @@ async function fetchBest() {
       const score = (data.score !== undefined ? data.score : null);
       return _sigFromParts(aid, bbox, score);
     } catch (e) { return null; }
+  }
+
+  // GS overlay settings
+  let GS_GRID_SPACING_METERS = 10; // configurable grid spacing
+  let GS_SHOW_CROSSHAIR = true;
+  const GS_DEFAULT_FOV_X_RAD = 0.3069;
+  const GS_DEFAULT_FOV_Y_RAD = 0.2046;
+
+  function asFiniteNumber(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function getAssignmentImageTelemetry(assignment) {
+    // Newer schema: assignment.image.telemetry.gps.latitude/longitude
+    // Legacy schema fallback: assignment.telemetry.latitude/longitude
+    const imgTelem = assignment && assignment.image && assignment.image.telemetry ? assignment.image.telemetry : null;
+    const legacyTelem = assignment && assignment.telemetry ? assignment.telemetry : null;
+    const telemetry = imgTelem || legacyTelem;
+    if (!telemetry) return null;
+
+    const lat = asFiniteNumber(telemetry.gps && telemetry.gps.latitude !== undefined ? telemetry.gps.latitude : telemetry.latitude);
+    const lon = asFiniteNumber(telemetry.gps && telemetry.gps.longitude !== undefined ? telemetry.gps.longitude : telemetry.longitude);
+    const altitude = asFiniteNumber(telemetry.altitude);
+    return { lat, lon, altitude };
+  }
+
+  function getAssignmentImageFov(assignment) {
+    const f = assignment && assignment.image && assignment.image.fov ? assignment.image.fov : null;
+    const x = asFiniteNumber(f && f.x);
+    const y = asFiniteNumber(f && f.y);
+    return {
+      x: x && x > 0 ? x : GS_DEFAULT_FOV_X_RAD,
+      y: y && y > 0 ? y : GS_DEFAULT_FOV_Y_RAD,
+    };
+  }
+
+  function drawGsGridOverlay(ctx, w, h, assignment) {
+    if (GS_GRID_SPACING_METERS <= 0) return;
+    const telemetry = getAssignmentImageTelemetry(assignment);
+    if (!telemetry || telemetry.altitude === null || telemetry.altitude <= 0) return;
+
+    const fov = getAssignmentImageFov(assignment);
+    const groundWidthMeters = 2 * telemetry.altitude * Math.tan(fov.x / 2);
+    const groundHeightMeters = 2 * telemetry.altitude * Math.tan(fov.y / 2);
+    if (!Number.isFinite(groundWidthMeters) || !Number.isFinite(groundHeightMeters) || groundWidthMeters <= 0 || groundHeightMeters <= 0) return;
+
+    const pxPerMeterX = w / groundWidthMeters;
+    const pxPerMeterY = h / groundHeightMeters;
+    const stepX = GS_GRID_SPACING_METERS * pxPerMeterX;
+    const stepY = GS_GRID_SPACING_METERS * pxPerMeterY;
+    if (!Number.isFinite(stepX) || !Number.isFinite(stepY) || stepX < 4 || stepY < 4) return;
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 180, 255, 0.55)';
+    ctx.lineWidth = 1;
+
+    for (let x = 0; x <= w; x += stepX) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let y = 0; y <= h; y += stepY) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    // Optional image center crosshair
+    if (GS_SHOW_CROSSHAIR) {
+      ctx.strokeStyle = 'rgba(255, 215, 0, 0.8)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(w / 2, 0);
+      ctx.lineTo(w / 2, h);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2);
+      ctx.lineTo(w, h / 2);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   function createEntryCard(label, data, metaFilename, isBest) {
@@ -281,11 +382,52 @@ async function fetchBest() {
           const h = Math.round(w / ratio);
           canvas.width = w; canvas.height = h;
           ctx.drawImage(img, 0, 0, w, h);
+          drawGsGridOverlay(ctx, w, h, latest.assignment || null);
         };
         img.onerror = () => {
           const ctx = canvas.getContext('2d'); ctx.fillStyle = '#f3f3f3'; ctx.fillRect(0,0,canvas.width,canvas.height);
         };
         img.src = '/export/' + (latest.full_image || '');
+
+        // Grid legend (key)
+        const legendDiv = document.createElement('div');
+        legendDiv.style.marginTop = '8px';
+        legendDiv.style.fontSize = '13px';
+        legendDiv.style.color = '#333';
+        legendDiv.style.background = '#f7f7f7';
+        legendDiv.style.border = '1px solid #e2e2e2';
+        legendDiv.style.borderRadius = '4px';
+        legendDiv.style.padding = '8px';
+        legendDiv.innerHTML =
+          '<div style="font-weight:600; margin-bottom:6px">Key</div>' +
+          '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px">' +
+            '<span style="display:inline-block; width:28px; border-top:2px solid rgba(0, 180, 255, 0.85)"></span>' +
+            '<span>Blue lines: every ' + GS_GRID_SPACING_METERS + ' m on ground</span>' +
+          '</div>' +
+          '<div style="display:flex; align-items:center; gap:8px">' +
+            '<span style="display:inline-block; width:28px; border-top:2px solid rgba(255, 215, 0, 0.95)"></span>' +
+            '<span>Yellow lines: image center crosshair</span>' +
+          '</div>';
+        card.appendChild(legendDiv);
+
+        // Location block (lat/lon)
+        try {
+          const telemetry = getAssignmentImageTelemetry(latest.assignment || null);
+          const lat = telemetry ? telemetry.lat : null;
+          const lon = telemetry ? telemetry.lon : null;
+          const altitude = telemetry ? telemetry.altitude : null;
+          
+          const locDiv = document.createElement('div');
+          locDiv.style.marginTop = '12px';
+          locDiv.style.padding = '8px';
+          locDiv.style.background = '#f0f0f0';
+          locDiv.style.borderRadius = '4px';
+          locDiv.innerHTML = '<strong>Location</strong><div style="font-size:14px; margin-top:4px">' +
+                             'Lat: ' + (lat !== null ? lat.toFixed(6) : 'N/A') + '<br>' +
+                             'Lon: ' + (lon !== null ? lon.toFixed(6) : 'N/A') + '<br>' +
+                             'Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '<br>';
+          card.appendChild(locDiv);
+        } catch (e) { console.error('Error rendering location:', e); }
 
         // Assignment block (minimal)
         const assignDiv = document.createElement('div');
@@ -299,6 +441,30 @@ async function fetchBest() {
       gsPanel.innerHTML = '<div class="gs-card empty">Error loading GS image</div>';
     }
   }
+
+  // Grid spacing control
+  try {
+    const gsSpacingSelect = document.getElementById('gs-grid-spacing');
+    const gsShowCrosshair = document.getElementById('gs-show-crosshair');
+    if (gsSpacingSelect) {
+      const initial = Number(gsSpacingSelect.value);
+      if (Number.isFinite(initial) && initial > 0) GS_GRID_SPACING_METERS = initial;
+      gsSpacingSelect.addEventListener('change', () => {
+        const v = Number(gsSpacingSelect.value);
+        if (Number.isFinite(v) && v > 0) {
+          GS_GRID_SPACING_METERS = v;
+          refresh();
+        }
+      });
+    }
+    if (gsShowCrosshair) {
+      GS_SHOW_CROSSHAIR = !!gsShowCrosshair.checked;
+      gsShowCrosshair.addEventListener('change', () => {
+        GS_SHOW_CROSSHAIR = !!gsShowCrosshair.checked;
+        refresh();
+      });
+    }
+  } catch (e) { console.warn('Grid spacing control unavailable', e); }
 
   refresh();
   setInterval(refresh, 10000);
