@@ -5,40 +5,86 @@ In addition to its light-weight process for mission-critical ML tasks, it also h
 functionality, including a script to transform annotated data 
 into an easily-processable CSV for ML training.
 
-## Docker
+## Notes
 
-You'll need to have docker installed on your machine. You can download it from [here](https://www.docker.com/products/docker-desktop/).
+### Clearing the frontend
 
-### Run everything in docker at once with docker-compose
+To delete the images on the frontend, delete the `./exports` folder completely. The folder includes the images and metadata for the images shown on the frontend.
 
-```bash
-docker-compose up --build
+**DO NOT** delete the `./exports` folder when local-hawk-ai is running.
+
+### To clear cloud images:
+
+To clear the images in the queue and best-saved images:
+
+
+```
+http://<cloud ip>:8000/api/clear
 ```
 
-### Otherwise take the following steps:
+**NOTE!** This will not fully clear the images because the queues are shared between processes, so clearing once won't necessarily clear all the images actually in the queue. 
 
-1. Build Docker image
+### Autopilot playload format
 
-```bash
-docker build -t intsys-client .
+```
+{
+“lat”: float,
+“lng”: float,
+“target_type” : str, either “person” or “tent”
+“id”: 0, 1, 2, 3 (increment up every time something is sent)
+}
 ```
 
-2. Run Docker container with GS server at 192.168.1.2:9000
+## Running the local worker directly (`core.py`)
+
+You can also run the local worker without Docker:
 
 ```bash
-docker run --rm -it --name intsys-client intsys-client
+python core.py [options]
 ```
 
-Run Docker container locally or with custom IP address
 
-Locally:
-```bash
-docker run --rm -it --name intsys-client intsys-client --ip host.docker.internal:9000
-```
+### Command-line arguments
 
-Custom IP address:
+The local worker (`core.py`) accepts the following command-line arguments:
+
+- `--local` (flag)
+  - Use localhost defaults for GS/CS addresses. When set, the worker will use:
+    - `gs = 127.0.0.1:9000`
+    - `cs = 127.0.0.1:8000`
+
+- `--gsip <host:port>`
+  - Ground Station API address (used when `--local` is not set).
+  - Default: `127.0.0.1:9000`
+
+- `--csip <host:port>`
+  - Cloud Server API address (used when `--local` is not set).
+  - Default: `34.106.160.143:8000`
+
+- `--map-port <int>`
+  - Port for the map-command HTTP server (serves the frontend UI).
+  - Default: `8080`
+
+- `--interval-seconds <float>`
+  - Scheduler interval (seconds) between cloud polls and autopilot sends.
+  - Default: `20.0`
+
+- `--autopilot-ip <host>`
+  - Autopilot host/IP to which target payloads are POSTed. If omitted, autopilot posting is disabled.
+  - Default: `None`
+
+- `--autopilot-port <int>`
+  - Autopilot port to POST target payloads to.
+  - Default: `8001`
+
+- `--map-idle-timeout <float>`
+  - Seconds of ingest idle time before the mapping pipeline auto-triggers. Set to `0` to disable auto-trigger.
+  - Default: `20`
+
+Example usage:
+
 ```bash
-docker run --rm -it --name intsys-client intsys-client --ip <ip_address>
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1 --autopilot-port 8001 --map-idle-timeout 20
 ```
 
 ### To Generate Map, use the Intsys GS
@@ -47,10 +93,127 @@ docker run --rm -it --name intsys-client intsys-client --ip <ip_address>
 
 Download the model weights from the Box folder and place them in the `model_weights` directory. The required weight files are:
 
-- `model_weights/maskrcnn_Mar52025.pth`
-- `model_weights/filter_classifier_weights.pt`
-- `model_weights/number_classifier_weights_resnet18.pt`
+# local-hawk-ai
 
-# Other Utilities
-Other functionality exists in`./utils`. The only tool currently is a script to process annotated data from CVAT
-into a `.csv` for further processing / ML training. To use it, check out the `README.md` in that sub-directory.
+Current local runtime for GS ingestion, cloud upload/pull, GroundingDINO fallback detection, mapping, and a small results dashboard.
+
+## What this repo currently does
+
+- Pulls image assignments from GS and fetches image bytes.
+- Uploads full images to the cloud inference service.
+- Polls cloud best-image endpoints (tent + mannequin), deduplicates repeated detections, and stores current best results.
+- Runs a local GroundingDINO fallback proposal step (`GDDetection`) for person/tent candidates when cloud results are unavailable.
+- Projects selected targets to lat/lon and optionally posts to an autopilot endpoint.
+- Runs a local HTTP server for:
+  - result dashboard UI,
+  - SSE updates,
+  - map trigger commands,
+  - cloud push result ingestion.
+- Runs a GPS+SIFT stitching pipeline to generate map outputs from session telemetry/images.
+
+Primary entrypoint: [core.py](core.py)
+
+## Main components
+
+- Worker loop and scheduler: [core.py](core.py)
+- GS/cloud HTTP client: [communication/work_client.py](communication/work_client.py)
+- HTTP API + dashboard server: [communication/intsys_gs_api.py](communication/intsys_gs_api.py)
+- Frontend UI: [frontend/index.html](frontend/index.html)
+- Mapping pipeline: [mapping/main_gps_sift.py](mapping/main_gps_sift.py)
+- GroundingDINO wrapper used by worker: [constructs/detection.py](constructs/detection.py)
+- Lightweight websocket uploader/listener client: [client.py](client.py)
+
+## Quick start (local Python)
+
+1. Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+2. Run the worker:
+
+```bash
+python core.py --local
+```
+
+3. Open dashboard:
+
+- http://127.0.0.1:8080
+
+## `core.py` CLI arguments (current)
+
+- `--local`
+  - Force GS/CS defaults:
+    - GS: `127.0.0.1:9000`
+    - CS: `127.0.0.1:8000`
+- `--gsip <host:port>` (default `127.0.0.1:9000`)
+- `--csip <host:port>` (default `34.106.160.143:8000`)
+- `--map-port <int>` (default `8080`)
+- `--interval-seconds <float>` (default `20.0`)
+- `--autopilot-ip <host>` (default `None`)
+- `--autopilot-port <int>` (default `8001`)
+- `--map-idle-timeout <float>` (default `20`, use `0` to disable)
+
+Example:
+
+```bash
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1 --autopilot-port 8001 --map-idle-timeout 20
+```
+
+## Local HTTP server behavior
+
+Served by `MapCommandHandler` from [communication/intsys_gs_api.py](communication/intsys_gs_api.py).
+
+- `GET /` → dashboard HTML
+- `GET /api/stream` → SSE stream
+- `GET /api/best` → latest metadata/results for tent/mannequin + GS pulls
+- `GET /export/<file>` → exported images and metadata JSON
+- `POST /api/result` → cloud pushes a labeled detection payload
+- `POST /` with command JSON:
+  - `start`
+  - `stop`
+  - `trigger_mapping`
+
+## Mapping pipeline notes
+
+- Session ingest dir: [mapping/current_session](mapping/current_session)
+- Session CSV: [mapping/current_session/metadata.csv](mapping/current_session/metadata.csv)
+- Generated outputs: [mapping](mapping)
+- Standalone mapping script: [mapping/main_gps_sift.py](mapping/main_gps_sift.py)
+
+The worker auto-triggers mapping after configurable ingest idle time (`--map-idle-timeout`) when enough images are present.
+
+## Optional websocket helper client
+
+Run [client.py](client.py) if you want a simple websocket listener + uploader utility:
+
+```bash
+python client.py --server ws://CLOUD_HOST:8001/ws --upload-url http://CLOUD_HOST:8001/upload-image --client-id my_local_id --watch-folder ./incoming
+```
+
+## Docker state (current)
+
+- Dockerfile exists: [Dockerfile](Dockerfile)
+- Compose exists: [docker-compose.yml](docker-compose.yml)
+- Entrypoint runs `python core.py`
+
+Use:
+
+```bash
+docker-compose up --build
+```
+
+## Known issues in current state
+
+- Legacy test script [test.py](test.py) still references old MaskRCNN/ImageNet classes and is not aligned with the current `GDDetection`-first flow.
+- Makefile targets in [Makefile](Makefile) are placeholders (`not implemented`).
+
+## Data and artifacts
+
+- Exported images/metadata for dashboard: [export](export)
+- Runtime logs: [logs](logs)
+- Model files folder: [model_weights](model_weights)
+- GroundingDINO package and weights:
+  - [GroundingDINO](GroundingDINO)
+  - [GroundingDINO/weights](GroundingDINO/weights)

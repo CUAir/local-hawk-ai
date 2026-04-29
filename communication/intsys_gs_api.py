@@ -18,6 +18,16 @@ from pathlib import Path
 EXPORT_DIR = Path(__file__).parent.parent / "export"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def ensure_export_dir() -> bool:
+    """Ensure EXPORT_DIR exists, even if deleted while process is running."""
+    try:
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        print_red(f"[export] Failed to create export directory: {e}")
+        return False
+
 # Simple Server-Sent Events (SSE) support for notifying frontend of new GS pulls
 SSE_CLIENTS = []
 SSE_LOCK = threading.Lock()
@@ -537,6 +547,8 @@ class MapCommandHandler(BaseHTTPRequestHandler):
             label, assignment, roi, classification, model_source, gemini_reason = _parse_result_payload(data)
             # Save the full image and ROI crop to export/ for inspection
             try:
+                if not ensure_export_dir():
+                    raise RuntimeError("export directory unavailable")
                 ts = int(time.time() * 1000)
                 label_name = str(label).lower()
                 aid = assignment.get('id') if assignment else 'noid'

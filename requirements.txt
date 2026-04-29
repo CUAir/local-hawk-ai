@@ -1,4 +1,4 @@
-# git+https://github.com/facebookresearch/detectron2.git
+# Core runtime
 requests
 pillow
 opencv-python
@@ -6,3 +6,16 @@ colorama
 numpy
 scipy
 websockets
+
+# ML runtime (used by classifiers + GroundingDINO)
+torch
+torchvision
+transformers
+timm
+addict
+yapf
+pyyaml
+
+# GroundingDINO utilities
+supervision>=0.22.0
+pycocotools
