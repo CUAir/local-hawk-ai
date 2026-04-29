@@ -5,6 +5,35 @@ In addition to its light-weight process for mission-critical ML tasks, it also h
 functionality, including a script to transform annotated data 
 into an easily-processable CSV for ML training.
 
+## Notes
+
+### Clearing the frontend
+
+To delete the images on the frontend, delete the `./exports` folder completely. The folder includes the images and metadata for the images shown on the frontend.
+
+**DO NOT** delete the `./exports` folder when local-hawk-ai is running.
+
+### To clear cloud images:
+
+To clear the images in the queue and best-saved images:
+
+
+```
+http://<cloud ip>:8000/api/clear
+```
+
+**NOTE!** This will not fully clear the images because the queues are shared between processes, so clearing once won't necessarily clear all the images actually in the queue. 
+
+### Autopilot playload format
+
+```
+{
+“lat”: float,
+“lng”: float,
+“target_type” : str, either “person” or “tent”
+“id”: 0, 1, 2, 3 (increment up every time something is sent)
+}
+```
 
 ## Running the local worker directly (`core.py`)
 
@@ -13,6 +42,7 @@ You can also run the local worker without Docker:
 ```bash
 python core.py [options]
 ```
+
 
 ### Command-line arguments
 

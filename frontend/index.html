@@ -23,6 +23,7 @@
     .notify small { color:#666; display:block }
     .assignment { margin-top:8px; }
     .assignment pre { font-size:12px; line-height:1.2; max-height:6em; overflow:auto; margin:6px 0 0 0; white-space:pre-wrap; }
+    .gemini-reason { font-size:12px; line-height:1.3; max-height:4em; overflow:auto; margin:4px 0 0 0; padding:4px; background:#f9f9f9; border-left:2px solid #ddd; }
   </style>
 </head>
 <body>
@@ -111,7 +112,12 @@ async function fetchBest() {
     html += '<div><strong>ID:</strong> ' + (data.assignment_id || 'N/A') + '</div>';
     html += '<div><strong>Score:</strong> ' + (data.score !== undefined ? data.score.toFixed(3) : 'N/A') + '</div>';
     html += '<div><strong>Source:</strong> ' + (data.model_source || 'unknown') + '</div>';
-    if (data.gemini_reason) html += '<div><strong>Gemini:</strong> ' + data.gemini_reason + '</div>';
+    if (data._is_cloud_pull) {
+      html += '<div><strong>Gemini:</strong><div class="gemini-reason">' + (data.gemini_reason || 'N/A') + '</div></div>';
+    } else if (data.gemini_reason) {
+      html += '<div><strong>Gemini:</strong><div class="gemini-reason">' + data.gemini_reason + '</div></div>';
+    }
+
     // Assignment / location details (if available)
     try {
       const a = data.assignment || null;
@@ -189,6 +195,7 @@ async function fetchBest() {
         let cloudBest = null;
         if (labelName === 'tent' && cloudTent) cloudBest = cloudTent;
         if (labelName === 'mannequin' && cloudMan) cloudBest = cloudMan;
+
         // If the cloud in-memory best corresponds to an exported meta that we're
         // also about to render, prefer the exported meta and skip the cloud-only
         // card to avoid showing two highlighted entries. If a cloud best exists
@@ -212,6 +219,7 @@ async function fetchBest() {
             // server may include inline base64 to avoid separate /export fetch
             full_image_b64: cloudBest.full_image_b64 || null,
             roi_image_b64: cloudBest.roi_image_b64 || null,
+            _is_cloud_pull: true,
           };
           const cloudCard = createEntryCard(labelName + ' (cloud)', cloudData, cloudBest._meta_filename || null, true);
           container.appendChild(cloudCard);

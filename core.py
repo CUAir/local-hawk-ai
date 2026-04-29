@@ -35,6 +35,16 @@ header = print_green
 logger = logging.getLogger(__name__)
 
 
+def _ensure_export_dir() -> bool:
+    """Ensure EXPORT_DIR exists, even if deleted mid-runtime."""
+    try:
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        print_red(f"[export] Failed to create export directory: {e}")
+        return False
+
+
 def _setup_file_logging() -> Path:
     logs_dir = Path(__file__).parent / "logs"
     logs_dir.mkdir(exist_ok=True)
@@ -450,26 +460,12 @@ class VisionClient:
         except Exception:
             pass
 
-    def _cloud_poller_loop(self):
-        """Deprecated: polling loop replaced by scheduler. Keep for compatibility."""
-        # Keep the old loop available but not used; new scheduler calls
-        # `_poll_cloud_once()` on its interval instead.
-        while True:
-            try:
-                self._poll_cloud_once()
-            except Exception as e:
-                print_yellow(f"[poller] Unexpected polling error: {e}")
-            time.sleep(self.result_interval_seconds)
-
     def _poll_cloud_once(self):
         """Perform a single poll of the cloud for mannequin and tent best images.
-
-        This is extracted from the previous `_cloud_poller_loop` to allow the
-        scheduler to poll once and then proceed to send results to autopilot.
         """
         # Mannequin
         try:
-            assign, roi, clf = self.work_client.get_mannequin_image()
+            assign, roi, clf, gemini_reason, model_source = self.work_client.get_mannequin_image()
             if assign is not None and roi is not None and clf is not None:
                 # Detect duplicate: same assignment id, bbox, and confidence
                 try:
@@ -488,6 +484,9 @@ class VisionClient:
                         pass
                 # proceed with persisting and recording only if not duplicate
                 if not is_dup:
+                    if not _ensure_export_dir():
+                        print_red("[poller] Skipping mannequin export write: export directory unavailable")
+                        return
                     ts = int(time.time() * 1000)
                     label_name = 'mannequin'
                     aid = assign.get('id') if assign else 'noid'
@@ -527,8 +526,8 @@ class VisionClient:
                         "label": label_name,
                         "assignment_id": aid,
                         "assignment": assign,
-                        "model_source": "cloud_pull",
-                        "gemini_reason": None,
+                        "model_source": model_source or "cloud_pull",
+                        "gemini_reason": gemini_reason,
                         "score": float(clf.label[1]) if clf is not None else 0.0,
                         "full_image": str(full_fn.name),
                         "roi_image": str(roi_fn.name),
@@ -572,7 +571,7 @@ class VisionClient:
 
         # Tent
         try:
-            assign, roi, clf = self.work_client.get_tent_image()
+            assign, roi, clf, gemini_reason, model_source = self.work_client.get_tent_image()
             if assign is not None and roi is not None and clf is not None:
                 # Duplicate detection for tent
                 try:
@@ -590,6 +589,9 @@ class VisionClient:
                         pass
                 if not is_dup:
                     try:
+                        if not _ensure_export_dir():
+                            print_red("[poller] Skipping tent export write: export directory unavailable")
+                            return
                         ts = int(time.time() * 1000)
                         label_name = 'tent'
                         aid = assign.get('id') if assign else 'noid'
@@ -633,8 +635,8 @@ class VisionClient:
                                     "label": label_name,
                                     "assignment_id": aid,
                                     "assignment": assign,
-                                    "model_source": "cloud_pull",
-                                    "gemini_reason": None,
+                                    "model_source": model_source or "cloud_pull",
+                                    "gemini_reason": gemini_reason,
                                     "score": float(clf.label[1]) if clf is not None else 0.0,
                                     "full_image": str(full_fn.name),
                                     "roi_image": str(roi_fn.name),
@@ -677,7 +679,7 @@ class VisionClient:
         print_green("[worker] Requesting image from imaging GS")
         self.request_image()
         time.sleep(1)
-        print_yellow("[worker] Uploading image + running backup detection")
+        print_green("[worker] Uploading image + running backup detection")
         self.run_model()
 
         print("[worker] Task cycle complete ========\n")
@@ -702,6 +704,8 @@ class VisionClient:
 
         # Export the raw ground-station pull (no processing yet) to EXPORT_DIR
         try:
+            if not _ensure_export_dir():
+                raise RuntimeError("export directory unavailable")
             ts = int(time.time() * 1000)
             aid = self.assignment.get('id') if self.assignment else 'noid'
             full_fn = EXPORT_DIR / f"full_gs_{aid}_{ts}.jpg"
@@ -815,6 +819,8 @@ class VisionClient:
             print(f"[gd_backup] Cached mannequin candidate (score={best_mannequin.score:.3f})")
             # Export cached GD backup to disk for inspection / frontend
             try:
+                if not _ensure_export_dir():
+                    raise RuntimeError("export directory unavailable")
                 ts = int(time.time() * 1000)
                 label_name = "mannequin"
                 aid = self.assignment.get('id') if self.assignment else 'noid'
@@ -869,6 +875,8 @@ class VisionClient:
             print(f"[gd_backup] Cached tent candidate (score={best_tent.score:.3f})")
             # Export cached GD backup to disk for inspection / frontend
             try:
+                if not _ensure_export_dir():
+                    raise RuntimeError("export directory unavailable")
                 ts = int(time.time() * 1000)
                 label_name = "tent"
                 aid = self.assignment.get('id') if self.assignment else 'noid'
@@ -938,6 +946,7 @@ def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultSto
             worker.run_task()
         except Exception as e:
             print_red(f"[worker] Unhandled worker error: {e}")
+            print("[worker] MOST LIKELY BECAUSE gs-backend isn't running or isn't connected")
 
 
 def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
