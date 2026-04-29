@@ -1050,7 +1050,7 @@ if __name__ == "__main__":
     parser.add_argument('--csip', type=str, default="34.106.160.143:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=20.0, help="Run send_result() every F seconds")
-    parser.add_argument('--autopilot-ip', type=str, default=None, help="Autopilot host/IP to POST target payloads to")
+    parser.add_argument('--autopilot-ip', type=str, default="192.168.1.4", help="Autopilot host/IP to POST target payloads to")
     parser.add_argument('--autopilot-port', type=int, default=8001, help="Autopilot port to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
