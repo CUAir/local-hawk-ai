@@ -25,7 +25,6 @@ from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
 import logging
-from constructs.detection import GDDetection
 from constructs.image_types import Base64Image, LabelTypes, ImageMeta, GeoLocation, CandidateImage
 from constructs.projection import GroundProjector
 
@@ -48,7 +47,36 @@ def _setup_file_logging() -> Path:
     return log_path
 
 
-GD_model = GDDetection()
+GD_model = None
+_GD_MODEL_INIT_ATTEMPTED = False
+_GD_MODEL_LOCK = threading.Lock()
+
+
+def _get_gd_model():
+    """
+    Lazily initialize GroundingDINO once.
+    This avoids heavy model/bootstrap work (and HF network calls) when running
+    mapping-only mode, where gd_backup is never used.
+    """
+    global GD_model, _GD_MODEL_INIT_ATTEMPTED
+    if GD_model is not None:
+        return GD_model
+    if _GD_MODEL_INIT_ATTEMPTED:
+        return None
+    with _GD_MODEL_LOCK:
+        if GD_model is not None:
+            return GD_model
+        if _GD_MODEL_INIT_ATTEMPTED:
+            return None
+        _GD_MODEL_INIT_ATTEMPTED = True
+        try:
+            from constructs.detection import GDDetection
+            GD_model = GDDetection()
+            return GD_model
+        except Exception as e:
+            print_red(f"[gd_backup] GroundingDINO init failed: {e}")
+            GD_model = None
+            return None
 
 MAX_BOX_FRACTION = 0.5
 
@@ -731,6 +759,10 @@ class VisionClient:
         cloud server has no result (204)."""
         if self.image is None or self.assignment is None:
             return
+        model = _get_gd_model()
+        if model is None:
+            # If model init fails, skip GD backup and continue cloud upload flow.
+            return
 
         import io as _io
         import base64 as _b64
@@ -746,7 +778,7 @@ class VisionClient:
         )
 
         try:
-            candidates = GD_model.detect_candidates(
+            candidates = model.detect_candidates(
                 base64_image,
                 max_box_fraction=MAX_BOX_FRACTION,
                 save_file=False,
@@ -923,7 +955,17 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
             print_yellow(f"[mapping] Idle monitor error: {e}")
         time.sleep(IDLE_MAPPING_POLL_SECONDS)
 
-def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8080, result_interval_seconds: float = 10.0, map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS, autopilot_host: str = None, autopilot_port: int = None):
+def main(
+    gs_ip_address: str,
+    cs_ip_address: str,
+    map_server_port: int = 8080,
+    result_interval_seconds: float = 10.0,
+    map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS,
+    autopilot_host: str = None,
+    autopilot_port: int = None,
+    mapping_only: bool = False,
+    enable_map_idle_trigger: bool = False,
+):
     log_path = _setup_file_logging()
     logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
     header(
@@ -941,8 +983,15 @@ def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8080, re
     # Start mapping HTTP server in a background thread so it runs concurrently
     threading.Thread(target=start_mapping_server, args=(mapper, result_store, map_server_port), daemon=True).start()
 
-    # Idle mapping monitor can run in a background thread
-    threading.Thread(target=idle_mapping_monitor_loop, args=(mapper, map_idle_timeout), daemon=True).start()
+    # Idle mapping monitor is opt-in; default is explicit-trigger-only mapping.
+    if enable_map_idle_trigger:
+        threading.Thread(
+            target=idle_mapping_monitor_loop,
+            args=(mapper, map_idle_timeout),
+            daemon=True,
+        ).start()
+    else:
+        print_yellow("[mapping] Auto-trigger disabled; waiting for explicit trigger_mapping requests")
 
     # Wait until the server has bound the port (or timeout)
     def _wait_for_port(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -960,6 +1009,11 @@ def main(gs_ip_address: str, cs_ip_address: str, map_server_port: int = 8080, re
         print_red(f"[startup] Warning: mapping server did not bind port {map_server_port} within timeout")
 
     # Run workers in the main process concurrently with the server thread
+    # unless we are only testing mapping trigger/server behavior.
+    if mapping_only:
+        print_yellow("[startup] Mapping-only mode enabled: worker loop disabled")
+        while True:
+            time.sleep(60)
     worker_loop(work_client, mapper, result_store, autopilot_host, autopilot_port, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
@@ -991,6 +1045,10 @@ if __name__ == "__main__":
     parser.add_argument('--autopilot-port', type=int, default=8001, help="Autopilot port to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
+    parser.add_argument('--mapping-only', action='store_true',
+                        help="Run only map server + mapping trigger logic (disable worker loop logs)")
+    parser.add_argument('--enable-map-idle-trigger', action='store_true',
+                        help="Enable automatic idle-time mapping trigger (disabled by default)")
 
     args = parser.parse_args()
 
@@ -1001,4 +1059,14 @@ if __name__ == "__main__":
         gs_ip_address = args.gsip
         cs_ip_address = args.csip
 
-    main(gs_ip_address, cs_ip_address, args.map_port, args.interval_seconds, args.map_idle_timeout, args.autopilot_ip, args.autopilot_port)
+    main(
+        gs_ip_address,
+        cs_ip_address,
+        args.map_port,
+        args.interval_seconds,
+        args.map_idle_timeout,
+        args.autopilot_ip,
+        args.autopilot_port,
+        args.mapping_only,
+        args.enable_map_idle_trigger,
+    )

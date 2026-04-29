@@ -182,6 +182,18 @@ def _parse_result_payload(data: dict):
 class MapCommandHandler(BaseHTTPRequestHandler):
     mapper = None
     result_store: ResultStore = None
+
+    def end_headers(self):
+        # Allow browser frontends on different origins to call this API.
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        # Handle CORS preflight requests.
+        self.send_response(204)
+        self.end_headers()
     
     def do_GET(self):
         """Handle mapping status, static files, and best-result API."""
