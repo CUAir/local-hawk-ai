@@ -43,20 +43,22 @@
       </div>
     </div>
     <div class="gs-column">
-      <div class="label">Latest GS Pull</div>
-      <div style="margin-bottom:10px; font-size:13px; color:#444; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-        <span>Grid spacing</span>
-        <select id="gs-grid-spacing" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
-          <option value="5">5 m</option>
-          <option value="10" selected>10 m</option>
-          <option value="25">25 m</option>
-          <option value="50">50 m</option>
-          <option value="100">100 m</option>
-        </select>
-        <label style="display:flex; align-items:center; gap:6px; user-select:none;">
-          <input id="gs-show-crosshair" type="checkbox" checked />
-          <span>Show center crosshair</span>
-        </label>
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
+        <div class="label" style="margin-bottom:0">Latest GS Pull</div>
+        <div style="font-size:13px; color:#444; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <span>Grid spacing</span>
+          <select id="gs-grid-spacing" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
+            <option value="5">5 m</option>
+            <option value="10" selected>10 m</option>
+            <option value="25">25 m</option>
+            <option value="50">50 m</option>
+            <option value="100">100 m</option>
+          </select>
+          <label style="display:flex; align-items:center; gap:6px; user-select:none;">
+            <input id="gs-show-crosshair" type="checkbox" checked />
+            <span>Show center crosshair</span>
+          </label>
+        </div>
       </div>
       <div id="gs-panel"></div>
     </div>
@@ -148,17 +150,20 @@ async function fetchBest() {
     ctx.strokeStyle = 'rgba(0, 180, 255, 0.55)';
     ctx.lineWidth = 1;
 
-    for (let x = 0; x <= w; x += stepX) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
+    // Draw vertical lines centered on image midpoint
+    const cx = w / 2, cy = h / 2;
+    for (let x = cx; x <= w; x += stepX) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
     }
-    for (let y = 0; y <= h; y += stepY) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-      ctx.stroke();
+    for (let x = cx - stepX; x >= 0; x -= stepX) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    }
+    // Draw horizontal lines centered on image midpoint
+    for (let y = cy; y <= h; y += stepY) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    for (let y = cy - stepY; y >= 0; y -= stepY) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
 
     // Optional image center crosshair
@@ -400,13 +405,15 @@ async function fetchBest() {
         legendDiv.style.padding = '8px';
         legendDiv.innerHTML =
           '<div style="font-weight:600; margin-bottom:6px">Key</div>' +
-          '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px">' +
-            '<span style="display:inline-block; width:28px; border-top:2px solid rgba(0, 180, 255, 0.85)"></span>' +
-            '<span>Blue lines: every ' + GS_GRID_SPACING_METERS + ' m on ground</span>' +
-          '</div>' +
-          '<div style="display:flex; align-items:center; gap:8px">' +
-            '<span style="display:inline-block; width:28px; border-top:2px solid rgba(255, 215, 0, 0.95)"></span>' +
-            '<span>Yellow lines: image center crosshair</span>' +
+          '<div style="display:flex; align-items:center; gap:18px; flex-wrap:wrap">' +
+            '<div style="display:flex; align-items:center; gap:8px">' +
+              '<span style="display:inline-block; width:28px; border-top:2px solid rgba(0, 180, 255, 0.85)"></span>' +
+              '<span>Blue lines: every ' + GS_GRID_SPACING_METERS + ' m on ground</span>' +
+            '</div>' +
+            '<div style="display:flex; align-items:center; gap:8px">' +
+              '<span style="display:inline-block; width:28px; border-top:2px solid rgba(255, 215, 0, 0.95)"></span>' +
+              '<span>Yellow lines: image center crosshair</span>' +
+            '</div>' +
           '</div>';
         card.appendChild(legendDiv);
 
@@ -422,10 +429,18 @@ async function fetchBest() {
           locDiv.style.padding = '8px';
           locDiv.style.background = '#f0f0f0';
           locDiv.style.borderRadius = '4px';
-          locDiv.innerHTML = '<strong>Location</strong><div style="font-size:14px; margin-top:4px">' +
-                             'Lat: ' + (lat !== null ? lat.toFixed(6) : 'N/A') + '<br>' +
-                             'Lon: ' + (lon !== null ? lon.toFixed(6) : 'N/A') + '<br>' +
-                             'Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '<br>';
+          locDiv.innerHTML = '<strong>Location</strong>' +
+                             '<div style="display:flex; gap:24px; margin-top:8px">' +
+                               '<div style="font-size:50px; font-weight:600;">' +
+                                 '<div style="font-size:15px; font-weight:400; color:#666; margin-bottom:2px">LAT</div>' +
+                                 (lat !== null ? lat.toFixed(6) : 'N/A') +
+                               '</div>' +
+                               '<div style="font-size:50px; font-weight:600;">' +
+                                 '<div style="font-size:15px; font-weight:400; color:#666; margin-bottom:2px">LON</div>' +
+                                 (lon !== null ? lon.toFixed(6) : 'N/A') +
+                               '</div>' +
+                             '</div>' +
+                             '<div style="font-size:13px; margin-top:6px; color:#555;">Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '</div>';
           card.appendChild(locDiv);
         } catch (e) { console.error('Error rendering location:', e); }
 

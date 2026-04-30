@@ -69,13 +69,9 @@ The local worker (`core.py`) accepts the following command-line arguments:
   - Scheduler interval (seconds) between cloud polls and autopilot sends.
   - Default: `20.0`
 
-- `--autopilot-ip <host>`
-  - Autopilot host/IP to which target payloads are POSTed. If omitted, autopilot posting is disabled.
-  - Default: `None`
-
-- `--autopilot-port <int>`
-  - Autopilot port to POST target payloads to.
-  - Default: `8001`
+- `--autopilot-ip <host:port>`
+  - Autopilot address (`host:port`) to which target payloads are POSTed. If omitted, autopilot posting is disabled.
+  - Default: `192.168.1.4:8001`
 
 - `--map-idle-timeout <float>`
   - Seconds of ingest idle time before the mapping pipeline auto-triggers. Set to `0` to disable auto-trigger.
@@ -84,7 +80,7 @@ The local worker (`core.py`) accepts the following command-line arguments:
 Example usage:
 
 ```bash
-python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1 --autopilot-port 8001 --map-idle-timeout 20
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
 ```
 
 ### To Generate Map, use the Intsys GS
@@ -151,14 +147,13 @@ python core.py --local
 - `--csip <host:port>` (default `34.106.160.143:8000`)
 - `--map-port <int>` (default `8080`)
 - `--interval-seconds <float>` (default `20.0`)
-- `--autopilot-ip <host>` (default `None`)
-- `--autopilot-port <int>` (default `8001`)
+- `--autopilot-ip <host:port>` (default `192.168.1.4:8001`)
 - `--map-idle-timeout <float>` (default `20`, use `0` to disable)
 
 Example:
 
 ```bash
-python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1 --autopilot-port 8001 --map-idle-timeout 20
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
 ```
 
 ## Local HTTP server behavior

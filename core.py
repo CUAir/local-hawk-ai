@@ -243,7 +243,7 @@ class Mapper:
         self.trigger_pipeline()
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, autopilot_port: int = None, result_interval_seconds: float = 10.0):
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
         header("\n[vision] Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
@@ -253,10 +253,9 @@ class VisionClient:
         self.result_store = result_store
         # Autopilot configuration
         self.autopilot_host = autopilot_host
-        self.autopilot_port = autopilot_port
         self.autopilot_url = None
-        if autopilot_host and autopilot_port:
-            self.autopilot_url = f"http://{autopilot_host}:{autopilot_port}/target"
+        if autopilot_host:
+            self.autopilot_url = f"http://{autopilot_host}/target"
         # incremental id for autopilot messages
         self._autopilot_id = 0
         # projector for ground coordinates
@@ -938,9 +937,9 @@ def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
     except Exception as e:
         print_red(f"Error in map HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, autopilot_port: int = None, result_interval_seconds: float = 10.0):
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
     header("\n[worker] Starting worker loop")
-    worker = VisionClient(work_client, mapper, result_store, autopilot_host, autopilot_port, result_interval_seconds)
+    worker = VisionClient(work_client, mapper, result_store, autopilot_host, result_interval_seconds)
     while True:
         try:
             worker.run_task()
@@ -971,7 +970,6 @@ def main(
     result_interval_seconds: float = 10.0,
     map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS,
     autopilot_host: str = None,
-    autopilot_port: int = None,
     mapping_only: bool = False,
     enable_map_idle_trigger: bool = False,
 ):
@@ -979,7 +977,7 @@ def main(
     logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
     header(
         f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
-        f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s, autopilot={autopilot_host}:{autopilot_port}"
+        f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s, autopilot={autopilot_host}"
     )
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
@@ -1023,7 +1021,7 @@ def main(
         print_yellow("[startup] Mapping-only mode enabled: worker loop disabled")
         while True:
             time.sleep(60)
-    worker_loop(work_client, mapper, result_store, autopilot_host, autopilot_port, result_interval_seconds)
+    worker_loop(work_client, mapper, result_store, autopilot_host, result_interval_seconds)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
@@ -1047,11 +1045,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
     parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
-    parser.add_argument('--csip', type=str, default="34.106.160.143:8000", help="Specify cloud server custom IP address")
+    parser.add_argument('--csip', type=str, default="34.106.149.232:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=10.0, help="Run send_result() every F seconds")
-    parser.add_argument('--autopilot-ip', type=str, default="192.168.1.4", help="Autopilot host/IP to POST target payloads to")
-    parser.add_argument('--autopilot-port', type=int, default=8001, help="Autopilot port to POST target payloads to")
+    parser.add_argument('--aip', type=str, default="192.168.1.4:8001", help="Autopilot host/IP to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
     parser.add_argument('--mapping-only', action='store_true',
@@ -1074,8 +1071,7 @@ if __name__ == "__main__":
         args.map_port,
         args.interval_seconds,
         args.map_idle_timeout,
-        args.autopilot_ip,
-        args.autopilot_port,
+        args.aip,
         args.mapping_only,
         args.enable_map_idle_trigger,
     )
