@@ -209,3 +209,5 @@ _opam/
 .vscode/*
 
 export
+
+local-hawk-ai/mapping/test_outputs
