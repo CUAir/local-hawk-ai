@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 # Directory to save exported images pushed by cloud
-EXPORT_DIR = Path(__file__).parent.parent / "export"
+EXPORT_DIR = Path(__file__).parent.parent / "exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
@@ -145,6 +145,13 @@ class ResultStore:
     def get_tent(self):
         with self._lock:
             return self._cloud.get('tent') or self._gd_best.get('tent')
+
+    def clear(self):
+        """Reset all in-memory best results (cloud-pulled and GD backup)."""
+        with self._lock:
+            self._cloud = {"tent": None, "mannequin": None}
+            self._gd_best = {"tent": None, "mannequin": None}
+        print_green("[result_store] Cleared all in-memory best results")
 
     def rebuild_from_disk(self, export_dir: Path):
         """Restore in-memory best-result state from previously exported meta files.
@@ -716,6 +723,38 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 else:
                     self.mapper.trigger_pipeline()
                     response = {"status": "success", "message": "Mapping triggered"}
+            elif command == 'clear_cloud':
+                try:
+                    work_client = getattr(self.mapper, 'work_client', None)
+                    if work_client is None:
+                        response = {"status": "error", "message": "work_client not available"}
+                    else:
+                        cloud_resp = work_client.clear_cloud()
+                        if 200 <= cloud_resp.status_code < 300:
+                            response = {"status": "success", "message": "Cloud server cleared"}
+                        else:
+                            response = {"status": "error", "message": f"Cloud server returned status {cloud_resp.status_code}"}
+                except Exception as e:
+                    response = {"status": "error", "message": f"Failed to clear cloud: {e}"}
+                    print_red(f"[api] clear_cloud failed: {e}")
+            elif command == 'clear_exports':
+                try:
+                    deleted = 0
+                    if EXPORT_DIR.exists():
+                        for f in EXPORT_DIR.iterdir():
+                            if f.is_file():
+                                try:
+                                    f.unlink()
+                                    deleted += 1
+                                except Exception:
+                                    pass
+                    if self.result_store is not None:
+                        self.result_store.clear()
+                    print_green(f"[export] Cleared {deleted} local file(s) from {EXPORT_DIR}")
+                    response = {"status": "success", "message": f"Deleted {deleted} local file(s)"}
+                except Exception as e:
+                    response = {"status": "error", "message": f"Failed to clear local exports: {e}"}
+                    print_red(f"[api] clear_exports failed: {e}")
             else:
                 response = {"status": "error", "message": f"Unknown command: {command}"}
             

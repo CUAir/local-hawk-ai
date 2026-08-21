@@ -256,6 +256,27 @@ class WorkClient(object):
 
         return response
 
+    def clear_cloud(self) -> requests.Response:
+        """DELETE /api/clear on the cloud server — resets its in-memory best
+        images and clears its mapping session queue/files. Requires the
+        `auth: admin` header per the cloud server's API."""
+        logger.info("Clearing cloud server state — url=%s", self.cs_url + "api/clear")
+        try:
+            response = self._do_request_with_retries(
+                'delete', self.cs_url + "api/clear",
+                headers={"auth": "admin"}, timeout=self.http_timeout_seconds,
+            )
+        except Exception as e:
+            print_red(f"[work_client] Failed to clear cloud after retries: {e}")
+            raise
+
+        if 200 <= response.status_code < 300:
+            print(f"[work_client] Cloud server cleared (status={response.status_code})")
+        else:
+            print_red(f"[work_client] Cloud clear failed (status={response.status_code})")
+
+        return response
+
     def get_tent_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str], typing.Optional[Image.Image]]:
         try:
             response = self._do_request_with_retries('get', self.cs_url + self.tent_img_endp, timeout=self.http_timeout_seconds)
