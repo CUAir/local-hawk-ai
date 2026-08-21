@@ -18,6 +18,22 @@ from pathlib import Path
 EXPORT_DIR = Path(__file__).parent.parent / "export"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+
+
+def render_frontend_index(hostname: str, server_port: int) -> bytes:
+    """Read frontend/index.html and point its API calls at the API/command server.
+
+    The page may be served statically from a different port than the API
+    server, so it needs to know where to send its fetch/EventSource calls.
+    We inject that as `window.MAP_API_BASE`, based on the requester's
+    hostname and the configured server_port.
+    """
+    index_file = FRONTEND_DIR / "index.html"
+    content = index_file.read_text(encoding="utf-8")
+    api_base = f"http://{hostname}:{server_port}"
+    return content.replace("__MAP_API_BASE__", api_base).encode("utf-8")
+
 
 def ensure_export_dir() -> bool:
     """Ensure EXPORT_DIR exists, even if deleted while process is running."""
@@ -130,6 +146,68 @@ class ResultStore:
         with self._lock:
             return self._cloud.get('tent') or self._gd_best.get('tent')
 
+    def rebuild_from_disk(self, export_dir: Path):
+        """Restore in-memory best-result state from previously exported meta files.
+
+        Lets a restarted process recover 'current best' (used by both the
+        dashboard and send_to_autopilot()) without waiting for a fresh
+        detection. Replays every detection meta file, in original timestamp
+        order, through update() so the same precedence rules apply as if the
+        process had been running continuously.
+        """
+        entries = []
+        for meta_path in export_dir.glob("meta_*.json"):
+            if meta_path.name.startswith("meta_gs_"):
+                continue  # raw GS pulls aren't detections
+            try:
+                with open(meta_path, "r") as f:
+                    meta = _json.load(f)
+                entries.append((meta.get("timestamp", 0), meta_path, meta))
+            except Exception as e:
+                print_yellow(f"[result_store] Skipping unreadable meta {meta_path.name}: {e}")
+
+        entries.sort(key=lambda entry: entry[0])
+
+        restored = 0
+        for _, meta_path, meta in entries:
+            try:
+                bbox = meta.get("bbox") or []
+                full_image_name = meta.get("full_image")
+                if len(bbox) != 4 or not full_image_name:
+                    continue
+                full_path = export_dir / full_image_name
+                if not full_path.exists():
+                    continue
+
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                full_image = Image.open(full_path).convert("RGB")
+                width, height = full_image.size
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                roi = ROI(roi=full_image.crop((x1, y1, x2, y2)), top_left=(x1, y1), bottom_right=(x2, y2))
+                label = _parse_label(meta.get("label"))
+                classification = Classification(label=label, number_conf=float(meta.get("score", 0.0)))
+                self.update(
+                    label,
+                    meta.get("assignment"),
+                    roi,
+                    classification,
+                    meta.get("model_source", ""),
+                    meta.get("gemini_reason"),
+                    meta_path.name,
+                )
+                restored += 1
+            except Exception as e:
+                print_yellow(f"[result_store] Failed to restore {meta_path.name}: {e}")
+
+        if restored:
+            print_green(f"[result_store] Restored {restored} detection(s) from {export_dir}")
+
 
 def _parse_label(raw_label) -> LabelType:
     if raw_label is None:
@@ -233,10 +311,10 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                     return
             # Serve frontend index
             if path == '/' or path == '/index.html':
-                frontend_dir = Path(__file__).parent.parent / 'frontend'
-                index_file = frontend_dir / 'index.html'
+                index_file = FRONTEND_DIR / 'index.html'
                 if index_file.exists():
-                    content = index_file.read_bytes()
+                    hostname = (self.headers.get('Host') or '').split(':')[0] or '127.0.0.1'
+                    content = render_frontend_index(hostname, self.server.server_address[1])
                     self.send_response(200)
                     self.send_header('Content-type', 'text/html')
                     self.end_headers()
@@ -554,11 +632,9 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 aid = assignment.get('id') if assignment else 'noid'
                 full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
                 roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
-                # The _parse_result_payload already created roi.roi (PIL Image) and we still have full image via roi
-                # But we don't have direct full_image variable here; reconstruct from roi by pasting onto new image of roi size is not needed.
                 # Save ROI crop
                 try:
-                    roi.roi.save(str(roi_fn), format="JPEG")
+                    roi.image.save(str(roi_fn), format="JPEG")
                 except Exception:
                     pass
 
@@ -693,7 +769,7 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(response).encode())
                 return response
-            
+
         except Exception as e:
             self.send_response(400)
             self.send_header('Content-type', 'application/json')
@@ -701,4 +777,31 @@ class MapCommandHandler(BaseHTTPRequestHandler):
             error_response = {"status": "error", "message": str(e)}
             print_red(f"Error: {error_response}")
             self.wfile.write(json.dumps(error_response).encode())
-            return error_response
+
+
+class FrontendHandler(BaseHTTPRequestHandler):
+    """Serves just the dashboard HTML, pointed at the API/command server.
+
+    Lets the frontend run on its own port, separate from the API/command
+    server (MapCommandHandler), which stays reachable at `server_port`.
+    """
+    server_port = 8080
+
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        super().end_headers()
+
+    def do_GET(self):
+        path = unquote(self.path.split('?', 1)[0])
+        if path == '/' or path == '/index.html':
+            index_file = FRONTEND_DIR / 'index.html'
+            if index_file.exists():
+                hostname = (self.headers.get('Host') or '').split(':')[0] or '127.0.0.1'
+                content = render_frontend_index(hostname, self.server_port)
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(content)
+                return
+        self.send_response(404)
+        self.end_headers()

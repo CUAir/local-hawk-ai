@@ -96,20 +96,20 @@ class WorkClient(object):
 
     def _parse_candidate_image(
         self, response: requests.Response
-    ) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str]]:
+    ) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str], typing.Optional[Image.Image]]:
         if response.status_code == 204:
             print("[work_client] Candidate endpoint returned 204 (no content yet)")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         if response.status_code != 200:
             print_red(f"[work_client] Failed to get candidate image (status={response.status_code})")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         try:
             candidate = response.json()
         except Exception as e:
             print_red(f"[work_client] Invalid candidate JSON response: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
         bbox = candidate.get("bbox") or []
         score = float(candidate.get("score", 0.0))
         label = self._parse_label(candidate.get("label"))
@@ -122,14 +122,14 @@ class WorkClient(object):
 
         if full_image is None or len(bbox) != 4:
             print_yellow("[work_client] Candidate missing valid source image or 4-value bbox")
-            return assignment, None, None, gemini_reason, model_source
-        
+            return assignment, None, None, gemini_reason, model_source, full_image
+
         width, height = full_image.size
         try:
             x1, y1, x2, y2 = [int(v) for v in bbox]
         except Exception:
             print_red(f"[work_client] Invalid bbox format: {bbox}")
-            return assignment, None, None, gemini_reason, model_source
+            return assignment, None, None, gemini_reason, model_source, full_image
 
         x1 = max(0, min(x1, width - 1))
         y1 = max(0, min(y1, height - 1))
@@ -138,13 +138,13 @@ class WorkClient(object):
 
         if x2 <= x1 or y2 <= y1:
             print_yellow(f"[work_client] Degenerate bbox after clipping: {[x1, y1, x2, y2]}")
-            return assignment, None, None, gemini_reason, model_source
+            return assignment, None, None, gemini_reason, model_source, full_image
 
         roi_image = full_image.crop((x1, y1, x2, y2))
         roi = ROI(roi=roi_image, top_left=(x1, y1), bottom_right=(x2, y2))
         classification = Classification(label=label, number_conf=score)
 
-        return assignment, roi, classification, gemini_reason, model_source
+        return assignment, roi, classification, gemini_reason, model_source, full_image
 
     def get_target_attributes(self) -> typing.Dict[str, list]:
         """
@@ -256,29 +256,29 @@ class WorkClient(object):
 
         return response
 
-    def get_tent_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str]]:
+    def get_tent_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str], typing.Optional[Image.Image]]:
         try:
             response = self._do_request_with_retries('get', self.cs_url + self.tent_img_endp, timeout=self.http_timeout_seconds)
         except requests.RequestException as e:
             print_red(f"[work_client] Tent request failed or timed out after retries: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
         except Exception as e:
             print_red(f"[work_client] Tent request failed after retries: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         if response.status_code == 204:
             print_yellow("[work_client] No tent image available from cloud yet (204)")
         return self._parse_candidate_image(response)
-    
-    def get_mannequin_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str]]:
+
+    def get_mannequin_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str], typing.Optional[Image.Image]]:
         try:
             response = self._do_request_with_retries('get', self.cs_url + self.mannequin_img_endp, timeout=self.http_timeout_seconds)
         except requests.RequestException as e:
             print_red(f"[work_client] Mannequin request failed or timed out after retries: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
         except Exception as e:
             print_red(f"[work_client] Mannequin request failed after retries: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         if response.status_code == 204:
             print_yellow("[work_client] No mannequin image available from cloud yet (204)")

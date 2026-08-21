@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from http.server import ThreadingHTTPServer
-from communication.intsys_gs_api import MapCommandHandler, ResultStore, EXPORT_DIR, notify_sse
+from communication.intsys_gs_api import MapCommandHandler, FrontendHandler, ResultStore, EXPORT_DIR, notify_sse
 import requests
 import io
 import base64
@@ -464,7 +464,7 @@ class VisionClient:
         """
         # Mannequin
         try:
-            assign, roi, clf, gemini_reason, model_source = self.work_client.get_mannequin_image()
+            assign, roi, clf, gemini_reason, model_source, full_image = self.work_client.get_mannequin_image()
             if assign is not None and roi is not None and clf is not None:
                 # Detect duplicate: same assignment id, bbox, and confidence
                 try:
@@ -491,12 +491,13 @@ class VisionClient:
                     aid = assign.get('id') if assign else 'noid'
                     full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
                     roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
-                    # Save ROI crop as both roi and full (no full image available)
+                    # Save the true full image (as returned by the cloud) so the dashboard
+                    # can show it with the bbox overlay, plus the ROI crop separately.
                     try:
                         import os as _os
                         import io as _io
                         buf = _io.BytesIO()
-                        roi.roi.save(buf, format='JPEG')
+                        (full_image if full_image is not None else roi.image).save(buf, format='JPEG')
                         data = buf.getvalue()
                         tmp_full = str(full_fn) + '.tmp'
                         with open(tmp_full, 'wb') as _f:
@@ -510,7 +511,7 @@ class VisionClient:
                         import os as _os
                         import io as _io
                         buf2 = _io.BytesIO()
-                        roi.roi.save(buf2, format='JPEG')
+                        roi.image.save(buf2, format='JPEG')
                         data2 = buf2.getvalue()
                         tmp_roi = str(roi_fn) + '.tmp'
                         with open(tmp_roi, 'wb') as _f2:
@@ -570,7 +571,7 @@ class VisionClient:
 
         # Tent
         try:
-            assign, roi, clf, gemini_reason, model_source = self.work_client.get_tent_image()
+            assign, roi, clf, gemini_reason, model_source, full_image = self.work_client.get_tent_image()
             if assign is not None and roi is not None and clf is not None:
                 # Duplicate detection for tent
                 try:
@@ -596,11 +597,13 @@ class VisionClient:
                         aid = assign.get('id') if assign else 'noid'
                         full_fn = EXPORT_DIR / f"full_{label_name}_{aid}_{ts}.jpg"
                         roi_fn = EXPORT_DIR / f"roi_{label_name}_{aid}_{ts}.jpg"
+                        # Save the true full image (as returned by the cloud) so the dashboard
+                        # can show it with the bbox overlay, plus the ROI crop separately.
                         try:
                             import os as _os
                             import io as _io
                             buf = _io.BytesIO()
-                            roi.roi.save(buf, format='JPEG')
+                            (full_image if full_image is not None else roi.image).save(buf, format='JPEG')
                             data = buf.getvalue()
                             tmp_full = str(full_fn) + '.tmp'
                             with open(tmp_full, 'wb') as _f:
@@ -614,7 +617,7 @@ class VisionClient:
                             import os as _os
                             import io as _io
                             buf2 = _io.BytesIO()
-                            roi.roi.save(buf2, format='JPEG')
+                            roi.image.save(buf2, format='JPEG')
                             data2 = buf2.getvalue()
                             tmp_roi = str(roi_fn) + '.tmp'
                             with open(tmp_roi, 'wb') as _f2:
@@ -831,7 +834,7 @@ class VisionClient:
                 except Exception:
                     pass
                 try:
-                    roi.roi.save(str(roi_fn), format="JPEG")
+                    roi.image.save(str(roi_fn), format="JPEG")
                 except Exception:
                     pass
                 # Write metadata sidecar JSON
@@ -886,7 +889,7 @@ class VisionClient:
                 except Exception:
                     pass
                 try:
-                    roi.roi.save(str(roi_fn), format="JPEG")
+                    roi.image.save(str(roi_fn), format="JPEG")
                 except Exception:
                     pass
                 try:
@@ -922,8 +925,8 @@ class VisionClient:
             print_yellow("[gd_backup] No tent candidate found in current image")
 
 
-def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
-    header(f"\n[mapping] Map HTTP server started on port {port}")
+def start_server(mapper: Mapper, result_store: ResultStore, port=8080):
+    header(f"\n[server] API/command HTTP server started on port {port}")
 
     # Set the mapper and result_store in the handler class
     MapCommandHandler.mapper = mapper
@@ -935,7 +938,19 @@ def start_mapping_server(mapper: Mapper, result_store: ResultStore, port=8080):
     try:
         server.serve_forever()
     except Exception as e:
-        print_red(f"Error in map HTTP server: {e}")
+        print_red(f"Error in API/command HTTP server: {e}")
+
+
+def start_frontend_server(port: int, server_port: int):
+    header(f"\n[frontend] Frontend HTTP server started on port {port}")
+
+    FrontendHandler.server_port = server_port
+    server = ThreadingHTTPServer(('0.0.0.0', port), FrontendHandler)
+
+    try:
+        server.serve_forever()
+    except Exception as e:
+        print_red(f"Error in frontend HTTP server: {e}")
 
 def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
     header("\n[worker] Starting worker loop")
@@ -966,7 +981,8 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
 def main(
     gs_ip_address: str,
     cs_ip_address: str,
-    map_server_port: int = 8080,
+    server_port: int = 8080,
+    frontend_port: int = 8081,
     result_interval_seconds: float = 10.0,
     map_idle_timeout: float = IDLE_MAPPING_TIMEOUT_SECONDS,
     autopilot_host: str = None,
@@ -976,19 +992,23 @@ def main(
     log_path = _setup_file_logging()
     logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
     header(
-        f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, map_port={map_server_port}, "
+        f"\n[startup] GS={gs_ip_address}, CS={cs_ip_address}, server_port={server_port}, frontend_port={frontend_port}, "
         f"send_interval={result_interval_seconds}s, map_idle_timeout={map_idle_timeout}s, autopilot={autopilot_host}"
     )
     # Create worker(s) with detector and classifier
     work_client = WorkClient(gs_ip_address, cs_ip_address)
     mapper = Mapper(work_client)
     result_store = ResultStore()
+    result_store.rebuild_from_disk(EXPORT_DIR)
 
     # Initialize mapping session directory (wipes stale data, creates clean dirs)
     _reset_session()
 
-    # Start mapping HTTP server in a background thread so it runs concurrently
-    threading.Thread(target=start_mapping_server, args=(mapper, result_store, map_server_port), daemon=True).start()
+    # Start the API/command HTTP server in a background thread so it runs concurrently
+    threading.Thread(target=start_server, args=(mapper, result_store, server_port), daemon=True).start()
+
+    # Start the frontend HTTP server in its own background thread
+    threading.Thread(target=start_frontend_server, args=(frontend_port, server_port), daemon=True).start()
 
     # Idle mapping monitor is opt-in; default is explicit-trigger-only mapping.
     if enable_map_idle_trigger:
@@ -1011,9 +1031,9 @@ def main(
                 time.sleep(0.05)
         return False
 
-    bound = _wait_for_port('127.0.0.1', map_server_port, timeout=3.0)
+    bound = _wait_for_port('127.0.0.1', server_port, timeout=3.0)
     if not bound:
-        print_red(f"[startup] Warning: mapping server did not bind port {map_server_port} within timeout")
+        print_red(f"[startup] Warning: API/command server did not bind port {server_port} within timeout")
 
     # Run workers in the main process concurrently with the server thread
     # unless we are only testing mapping trigger/server behavior.
@@ -1046,7 +1066,8 @@ if __name__ == "__main__":
     parser.add_argument('--local', action='store_true', help="Use local IP address")
     parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
     parser.add_argument('--csip', type=str, default="34.106.149.232:8000", help="Specify cloud server custom IP address")
-    parser.add_argument('--map-port', type=int, default=8080, help="Port for the map command HTTP server")
+    parser.add_argument('--server-port', type=int, default=8080, help="Port for the API/command HTTP server (dashboard API, SSE, exports, mapping/command endpoints)")
+    parser.add_argument('--frontend-port', type=int, default=8081, help="Port for the frontend dashboard HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=10.0, help="Run send_result() every F seconds")
     parser.add_argument('--aip', type=str, default="192.168.1.4:8001", help="Autopilot host/IP to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
@@ -1061,17 +1082,20 @@ if __name__ == "__main__":
     if args.local:
         gs_ip_address = "127.0.0.1:9000"
         cs_ip_address = "127.0.0.1:8000"
+        a_ip_address = "127.0.0.1:8001"
     else:
         gs_ip_address = args.gsip
         cs_ip_address = args.csip
+        a_ip_address = args.aip
 
     main(
         gs_ip_address,
         cs_ip_address,
-        args.map_port,
+        args.server_port,
+        args.frontend_port,
         args.interval_seconds,
         args.map_idle_timeout,
-        args.aip,
+        a_ip_address,
         args.mapping_only,
         args.enable_map_idle_trigger,
     )

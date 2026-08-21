@@ -61,9 +61,13 @@ The local worker (`core.py`) accepts the following command-line arguments:
   - Cloud Server API address (used when `--local` is not set).
   - Default: `34.106.160.143:8000`
 
-- `--map-port <int>`
-  - Port for the map-command HTTP server (serves the frontend UI).
+- `--server-port <int>`
+  - Port for the API/command HTTP server (dashboard API, SSE, exports, mapping/command endpoints). Also serves the dashboard UI directly for backward compatibility.
   - Default: `8080`
+
+- `--frontend-port <int>`
+  - Port for the frontend dashboard HTTP server (serves the same dashboard UI, pointed at `--server-port` for its API calls).
+  - Default: `8081`
 
 - `--interval-seconds <float>`
   - Scheduler interval (seconds) between cloud polls and autopilot sends.
@@ -80,7 +84,7 @@ The local worker (`core.py`) accepts the following command-line arguments:
 Example usage:
 
 ```bash
-python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --server-port 8080 --frontend-port 8081 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
 ```
 
 ### To Generate Map, use the Intsys GS
@@ -135,7 +139,7 @@ python core.py --local
 
 3. Open dashboard:
 
-- http://127.0.0.1:8080
+- http://127.0.0.1:8081 (dedicated frontend server), or http://127.0.0.1:8080 (API/command server, also serves the dashboard for backward compatibility)
 
 ## `core.py` CLI arguments (current)
 
@@ -144,8 +148,9 @@ python core.py --local
     - GS: `127.0.0.1:9000`
     - CS: `127.0.0.1:8000`
 - `--gsip <host:port>` (default `127.0.0.1:9000`)
-- `--csip <host:port>` (default `34.106.160.143:8000`)
-- `--map-port <int>` (default `8080`)
+- `--csip <host:port>` (default `34.106.149.232:8000`)
+- `--server-port <int>` (default `8080`) — API/command HTTP server (dashboard API, SSE, exports, mapping/command endpoints)
+- `--frontend-port <int>` (default `8081`) — dedicated frontend dashboard HTTP server
 - `--interval-seconds <float>` (default `20.0`)
 - `--autopilot-ip <host:port>` (default `192.168.1.4:8001`)
 - `--map-idle-timeout <float>` (default `20`, use `0` to disable)
@@ -153,22 +158,22 @@ python core.py --local
 Example:
 
 ```bash
-python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --map-port 8080 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
+python core.py --gsip 192.168.1.2:9000 --csip 10.0.0.2:8000 --server-port 8080 --frontend-port 8081 --interval-seconds 20 --autopilot-ip 127.0.0.1:8001 --map-idle-timeout 20
 ```
 
 ## Local HTTP server behavior
 
-Served by `MapCommandHandler` from [communication/intsys_gs_api.py](communication/intsys_gs_api.py).
+Two HTTP servers run side by side:
 
-- `GET /` → dashboard HTML
-- `GET /api/stream` → SSE stream
-- `GET /api/best` → latest metadata/results for tent/mannequin + GS pulls
-- `GET /export/<file>` → exported images and metadata JSON
-- `POST /api/result` → cloud pushes a labeled detection payload
-- `POST /` with command JSON:
-  - `start`
-  - `stop`
-  - `trigger_mapping`
+- **API/command server** (`--server-port`, default 8080) — `MapCommandHandler` from [communication/intsys_gs_api.py](communication/intsys_gs_api.py):
+  - `GET /` → dashboard HTML (backward-compatible; same content as the frontend server)
+  - `GET /api/stream` → SSE stream
+  - `GET /api/best` → latest metadata/results for tent/mannequin + GS pulls
+  - `GET /export/<file>` → exported images and metadata JSON
+  - `POST /api/result` → cloud pushes a labeled detection payload
+  - `POST /` with command JSON: `start`, `stop`, `trigger_mapping`
+- **Frontend server** (`--frontend-port`, default 8081) — `FrontendHandler` from [communication/intsys_gs_api.py](communication/intsys_gs_api.py):
+  - `GET /` → dashboard HTML only, with its API calls pointed at `--server-port`
 
 ## Mapping pipeline notes
 

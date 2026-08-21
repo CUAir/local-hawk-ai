@@ -1,0 +1,17 @@
+{
+  "timestamp": 1777643415,
+  "imgMode": "fixed",
+  "telemetry": {
+    "altitude": 18.207,
+    "planeYaw": 108.00988392841816,
+    "gps": {
+      "latitude": 42.4452987,
+      "longitude": -76.4416853
+    },
+    "gimOrt": {
+      "pitch": 7.19261267825067,
+      "roll": 0.2825907736192457
+    }
+  },
+  "timestamp_utc": "2026-05-01 13:50:15 UTC"
+}

@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>Local Hawk AI - Results</title>
+  <script>window.MAP_API_BASE = "__MAP_API_BASE__";</script>
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; }
     .container { display:flex; gap:24px; }
@@ -65,9 +66,11 @@
   </div>
 
 <script>
+const API_BASE = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
+
 async function fetchBest() {
   try {
-    const res = await fetch('/api/best');
+    const res = await fetch(`${API_BASE}/api/best`);
     if (!res.ok) throw new Error('failed');
     return await res.json();
   } catch (e) { console.error(e); return null; }
@@ -202,7 +205,7 @@ async function fetchBest() {
     } catch (e) {}
     card.appendChild(header);
 
-    let imgSrc = '/export/' + (data.full_image || '');
+    let imgSrc = `${API_BASE}/export/` + (data.full_image || '');
     // Prefer inline base64 data if provided by the server to avoid extra fetch races
     if (data.full_image_b64) {
       imgSrc = data.full_image_b64;
@@ -392,7 +395,7 @@ async function fetchBest() {
         img.onerror = () => {
           const ctx = canvas.getContext('2d'); ctx.fillStyle = '#f3f3f3'; ctx.fillRect(0,0,canvas.width,canvas.height);
         };
-        img.src = '/export/' + (latest.full_image || '');
+        img.src = `${API_BASE}/export/` + (latest.full_image || '');
 
         // Grid legend (key)
         const legendDiv = document.createElement('div');
@@ -486,7 +489,7 @@ async function fetchBest() {
 
   // Live updates via Server-Sent Events: refresh on GS pulls or other events
   try {
-    const es = new EventSource('/api/stream');
+    const es = new EventSource(`${API_BASE}/api/stream`);
     es.addEventListener('gs_pull', (e) => {
       try { refresh(); } catch (err) { console.error('refresh failed', err); }
     });
