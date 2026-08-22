@@ -277,6 +277,21 @@ class WorkClient(object):
 
         return response
 
+    def check_cloud_saved(self) -> dict:
+        """Check whether the cloud server currently has a saved best image for
+        tent and/or mannequin (GET .../tent and .../mannequin return 200 if
+        something is saved, 204 if not), without fully downloading/parsing
+        the image. Returns {"tent": bool|None, "mannequin": bool|None},
+        where None means the check itself failed (e.g. connection error)."""
+        result = {"tent": None, "mannequin": None}
+        for label, endpoint in (("tent", self.tent_img_endp), ("mannequin", self.mannequin_img_endp)):
+            try:
+                response = self._do_request_with_retries('get', self.cs_url + endpoint, timeout=self.http_timeout_seconds)
+                result[label] = response.status_code == 200
+            except Exception as e:
+                print_red(f"[work_client] Failed to check cloud {label} status: {e}")
+        return result
+
     def get_tent_image(self) -> tuple[typing.Optional[dict], typing.Optional[ROI], typing.Optional[Classification], typing.Optional[str], typing.Optional[str], typing.Optional[Image.Image]]:
         try:
             response = self._do_request_with_retries('get', self.cs_url + self.tent_img_endp, timeout=self.http_timeout_seconds)

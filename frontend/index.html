@@ -5,84 +5,289 @@
   <title>Local Hawk AI - Results</title>
   <script>window.MAP_API_BASE = "__MAP_API_BASE__";</script>
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; }
-    .container { display:flex; gap:24px; }
-    .column { flex:1; min-width:300px; }
-    .card { border:1px solid #ddd; padding:12px; border-radius:6px; margin-bottom:12px; background:#fff }
-    .card.highlight { border:3px solid #2aa02a; box-shadow:0 0 8px rgba(42,160,42,0.12) }
-    .thumb { width:100%; height:auto; border:1px solid #ccc; display:block }
-    .meta { margin-top:8px; font-size:14px; }
-    .label { font-weight:600; margin-bottom:8px }
-    .empty { color:#888; }
-    .timestamp { color:#666; font-size:12px }
-    .log { max-height: 80vh; overflow:auto; padding-right:8px }
-    .bbox { position:relative }
-    canvas.entry-canvas { width:100%; height:auto; display:block }
-    .results-section { flex: 1; display:flex; gap:24px; }
-    .gs-column { flex: 1; }
-    .gs-card { border:1px solid #ddd; padding:12px; border-radius:6px; background:#fafafa }
-    .notify { background:#fff8e1; border-left:4px solid #f0ad4e; padding:8px; margin-bottom:8px }
-    .notify small { color:#666; display:block }
-    .assignment { margin-top:8px; }
-    .assignment pre { font-size:12px; line-height:1.2; max-height:6em; overflow:auto; margin:6px 0 0 0; white-space:pre-wrap; }
-    .gemini-reason { font-size:12px; line-height:1.3; max-height:4em; overflow:auto; margin:4px 0 0 0; padding:4px; background:#f9f9f9; border-left:2px solid #ddd; }
-    .header-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-    .danger-btn { background:#fff; border:1px solid #c9302c; color:#c9302c; padding:8px 14px; border-radius:4px; cursor:pointer; font-size:13px; }
-    .danger-btn:hover { background:#c9302c; color:#fff; }
-    .danger-btn:disabled { opacity:0.5; cursor:default; background:#fff; color:#c9302c; }
-    .admin-actions { display:flex; gap:10px; flex-wrap:wrap; }
-    .action-status { font-size:13px; margin-top:6px; }
-    .action-status.success { color:#2aa02a; }
-    .action-status.error { color:#c9302c; }
+    :root {
+      --bg: #0b0f14;
+      --surface: #151c25;
+      --surface-2: #1e2632;
+      --border: #3a4759;
+      --text: #e6edf3;
+      --muted: #a7b3c4;
+      --accent: #34d399;
+      --accent-dim: rgba(52,211,153,.14);
+      --blue: #60a5fa;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --purple: #c084fc;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: var(--sans);
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.4;
+    }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+
+    /* Top bar */
+    .topbar {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap;
+      padding: 14px 20px;
+      background: rgba(11,15,20,0.92);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display:flex; align-items:center; gap:10px; }
+    .brand-dot {
+      width:10px; height:10px; border-radius:50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-dim);
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.45 } }
+    .topbar h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .1px; }
+    .subtitle { margin: 3px 0 0 0; font-size: 12.5px; color: var(--muted); max-width: 60ch; }
+    .topbar-right { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+    .conn-status { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
+    .status-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); transition:background .2s; }
+    .status-dot.ok { background: var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+    .status-dot.err { background: var(--red); box-shadow:0 0 0 3px rgba(248,113,113,.15); }
+
+    .admin-actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .btn {
+      font-family: var(--sans); font-size: 12.5px; font-weight: 600;
+      padding: 7px 13px; border-radius: 6px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+      transition: background .15s, border-color .15s, opacity .15s;
+    }
+    .btn:hover { border-color: var(--muted); }
+    .btn:disabled { opacity: .45; cursor: default; }
+    .btn-info { color: var(--blue); border-color: rgba(96,165,250,.35); }
+    .btn-info:hover { background: rgba(96,165,250,.12); }
+    .btn-danger { color: var(--red); border-color: rgba(248,113,113,.35); }
+    .btn-danger:hover { background: rgba(248,113,113,.12); }
+
+    .action-status { font-size: 12.5px; padding: 0 20px; min-height: 20px; }
+    .action-status.success { color: var(--accent); }
+    .action-status.error { color: var(--red); }
+    #notifications:empty { display: none; }
+
+    /* Board layout */
+    .board {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 18px;
+      padding: 18px 20px 28px;
+      align-items: start;
+    }
+    .col-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .col-title {
+      font-size: 12px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .col-title::before { content: ''; width: 8px; height: 8px; border-radius: 2px; display:inline-block; }
+    .col-title.tent::before { background: var(--amber); }
+    .col-title.mannequin::before { background: var(--purple); }
+    .col-title.gs::before { background: var(--blue); }
+    .count-badge {
+      font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: 999px; padding: 2px 9px; min-width: 20px; text-align: center;
+    }
+
+    .log { max-height: calc(100vh - 200px); overflow-y: auto; padding-right: 4px; }
+
+    .card {
+      border: 1px solid var(--border); border-radius: 10px;
+      background: var(--surface); padding: 12px;
+      margin-bottom: 12px;
+      transition: box-shadow .15s, border-color .15s;
+    }
+    .card.highlight {
+      border-color: rgba(52,211,153,.5);
+      box-shadow: 0 0 0 1px rgba(52,211,153,.15), 0 4px 16px rgba(52,211,153,.08);
+    }
+    .card .timestamp {
+      color: var(--muted); font-size: 11.5px; font-family: var(--mono);
+      display:flex; align-items:center; gap:5px; margin-bottom: 8px;
+    }
+    .card .timestamp::before { content: '⏱'; font-size: 11px; }
+
+    canvas.entry-canvas {
+      width: 100%; height: auto; display: block;
+      border-radius: 7px; border: 1px solid var(--border); background: #06090c;
+    }
+
+    .meta { margin-top: 10px; font-size: 13px; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 9px; border-radius: 999px;
+      font-size: 11.5px; font-weight: 650; letter-spacing: .1px;
+      border: 1px solid transparent; white-space: nowrap;
+    }
+    .chip-score-high { background: rgba(52,211,153,.12); color: var(--accent); border-color: rgba(52,211,153,.35); }
+    .chip-score-mid  { background: rgba(251,191,36,.12); color: var(--amber); border-color: rgba(251,191,36,.35); }
+    .chip-score-low  { background: rgba(248,113,113,.12); color: var(--red); border-color: rgba(248,113,113,.35); }
+    .chip-source     { background: rgba(96,165,250,.12); color: var(--blue); border-color: rgba(96,165,250,.35); }
+    .chip-id         { background: var(--surface-2); color: var(--muted); border-color: var(--border); font-family: var(--mono); }
+    .chip-dup        { background: rgba(251,191,36,.14); color: var(--amber); border-color: rgba(251,191,36,.4); }
+    .chip-timing     { background: rgba(192,132,252,.12); color: var(--purple); border-color: rgba(192,132,252,.35); font-family: var(--mono); }
+
+    .gemini-reason {
+      font-size: 12.5px; line-height: 1.4; max-height: 5.5em; overflow: auto;
+      margin: 8px 0 0 0; padding: 8px 10px;
+      background: var(--surface-2); border-left: 2px solid var(--blue); border-radius: 0 6px 6px 0;
+      color: var(--text);
+    }
+    .gemini-reason::before { content: '"Gemini — '; color: var(--muted); }
+    .gemini-reason::after { content: '"'; color: var(--muted); }
+
+    .loc-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+      margin-top: 10px; padding: 8px; background: var(--surface-2); border-radius: 8px;
+    }
+    .loc-grid .k { display: block; font-size: 9.5px; color: var(--muted); letter-spacing: .07em; }
+    .loc-grid .v { display: block; font-family: var(--mono); font-size: 12.5px; margin-top: 1px; }
+
+    details.assignment {
+      margin-top: 10px; font-size: 12px;
+    }
+    details.assignment summary {
+      cursor: pointer; color: var(--muted); font-size: 11.5px;
+      font-weight: 600; letter-spacing: .03em; user-select: none;
+    }
+    details.assignment summary:hover { color: var(--text); }
+    details.assignment pre {
+      font-size: 11.5px; font-family: var(--mono); line-height: 1.35;
+      max-height: 10em; overflow: auto; margin: 6px 0 0 0; white-space: pre-wrap;
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px;
+    }
+
+    .empty {
+      color: var(--muted); text-align: center; font-size: 12.5px;
+      border: 1px dashed var(--border); border-radius: 10px; padding: 22px 10px;
+    }
+    .skeleton { color: var(--muted); text-align:center; font-size:12.5px; padding: 22px 10px; }
+
+    /* GS column */
+    .gs-controls {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      font-size: 12px; color: var(--muted); margin-bottom: 10px;
+    }
+    .control { display: flex; align-items: center; gap: 6px; }
+    .control select {
+      background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 5px; padding: 4px 6px; font-size: 12px; font-family: var(--sans);
+    }
+    .control.checkbox { user-select: none; cursor: pointer; }
+    .control input[type="checkbox"] { accent-color: var(--accent); }
+
+    .gs-card {
+      border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 12px;
+    }
+    .gs-legend {
+      margin-top: 10px; font-size: 12px; color: var(--muted);
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    }
+    .gs-legend .legend-title { font-weight: 650; color: var(--text); margin-bottom: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+    .gs-legend .legend-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+    .legend-swatch { display: inline-block; width: 22px; border-top: 2px solid; margin-right: 6px; vertical-align: middle; }
+
+    .gs-loc {
+      margin-top: 12px; padding: 12px; background: var(--surface-2); border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .gs-loc .label-sm { font-size: 10.5px; color: var(--muted); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+    .gs-loc .hero-row { display: flex; gap: 26px; margin-top: 8px; flex-wrap: wrap; }
+    .gs-loc .hero-val { font-family: var(--mono); font-size: 28px; font-weight: 650; color: var(--text); line-height: 1; }
+    .gs-loc .hero-key { font-size: 11px; color: var(--muted); margin-bottom: 4px; letter-spacing: .05em; }
+    .gs-loc .alt-row { font-size: 12px; margin-top: 8px; color: var(--muted); font-family: var(--mono); }
+
+    @media (max-width: 720px) {
+      .topbar { padding: 12px 14px; }
+      .board { padding: 14px; grid-template-columns: 1fr; }
+      .gs-loc .hero-val { font-size: 22px; }
+    }
   </style>
 </head>
 <body>
-  <div class="header-row">
+  <div class="topbar">
     <div>
-      <h1 style="margin-bottom:4px">Local Hawk AI — Latest Results</h1>
-      <p style="margin-top:0">Shows the most recent saved result for each label (tent, mannequin). Images may come from cloud push or local GD backup.</p>
-    </div>
-    <div>
-      <div class="admin-actions">
-        <button id="btn-clear-cloud" class="danger-btn">Clear Cloud Server</button>
-        <button id="btn-clear-exports" class="danger-btn">Delete Local Saved Images</button>
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <h1>Local Hawk AI — Live Results</h1>
       </div>
-      <div id="admin-status" class="action-status"></div>
+      <p class="subtitle">Most recent tent &amp; mannequin detections (cloud push or local GD backup), plus the latest raw ground-station pull.</p>
+    </div>
+    <div class="topbar-right">
+      <div class="conn-status">
+        <span class="status-dot" id="sse-dot"></span>
+        <span id="sse-label">connecting…</span>
+      </div>
+      <div class="admin-actions">
+        <button id="btn-check-cloud" class="btn btn-info">Check Cloud Status</button>
+        <button id="btn-clear-cloud" class="btn btn-danger">Clear Cloud Server</button>
+        <button id="btn-clear-exports" class="btn btn-danger">Delete Local Saved Images</button>
+      </div>
     </div>
   </div>
+  <div id="admin-status" class="action-status"></div>
   <div id="notifications"></div>
-  <div class="container">
-    <div class="results-section">
-      <div class="column">
-        <div class="label">Tent</div>
-        <div class="log" id="log-tent"></div>
+
+  <main class="board">
+    <section aria-label="Tent detections">
+      <div class="col-head">
+        <span class="col-title tent">Tent</span>
+        <span class="count-badge" id="count-tent">0</span>
       </div>
-      <div class="column">
-          <div class="label">Mannequin</div>
-          <div class="log" id="log-mannequin"></div>
+      <div class="log" id="log-tent"><div class="skeleton">Loading…</div></div>
+    </section>
+
+    <section aria-label="Mannequin detections">
+      <div class="col-head">
+        <span class="col-title mannequin">Mannequin</span>
+        <span class="count-badge" id="count-mannequin">0</span>
       </div>
-    </div>
-    <div class="gs-column">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
-        <div class="label" style="margin-bottom:0">Latest GS Pull</div>
-        <div style="font-size:13px; color:#444; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-          <span>Grid spacing</span>
-          <select id="gs-grid-spacing" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
+      <div class="log" id="log-mannequin"><div class="skeleton">Loading…</div></div>
+    </section>
+
+    <section aria-label="Ground station pulls">
+      <div class="col-head">
+        <span class="col-title gs">Ground Station</span>
+        <span class="count-badge" id="count-gs">0</span>
+      </div>
+      <div class="gs-controls">
+        <label class="control">
+          <span>Grid</span>
+          <select id="gs-grid-spacing">
             <option value="5">5 m</option>
             <option value="10" selected>10 m</option>
             <option value="25">25 m</option>
             <option value="50">50 m</option>
             <option value="100">100 m</option>
           </select>
-          <label style="display:flex; align-items:center; gap:6px; user-select:none;">
-            <input id="gs-show-crosshair" type="checkbox" checked />
-            <span>Show center crosshair</span>
-          </label>
-        </div>
+        </label>
+        <label class="control checkbox">
+          <input id="gs-show-crosshair" type="checkbox" checked />
+          <span>Crosshair</span>
+        </label>
       </div>
-      <div id="gs-panel"></div>
-    </div>
-  </div>
+      <div class="log" id="gs-panel"><div class="skeleton">Loading…</div></div>
+    </section>
+  </main>
 
 <script>
 const API_BASE = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
@@ -98,6 +303,12 @@ async function fetchBest() {
     if (!ts) return 'N/A';
     const d = new Date(ts);
     return d.toLocaleString();
+  }
+  function fmtDuration(ms) {
+    const totalSecs = Math.max(0, ms / 1000);
+    const mins = Math.floor(totalSecs / 60);
+    const secs = (totalSecs - mins * 60).toFixed(1);
+    return `${mins}:${secs.padStart(4, '0')}`;
   }
   // Track duplicate counts by signature (assignment_id|bbox|score)
   const duplicateCounts = {};
@@ -115,6 +326,18 @@ async function fetchBest() {
       const score = (data.score !== undefined ? data.score : null);
       return _sigFromParts(aid, bbox, score);
     } catch (e) { return null; }
+  }
+
+  function scoreChipClass(score) {
+    if (typeof score !== 'number' || !Number.isFinite(score)) return 'chip-id';
+    if (score >= 0.7) return 'chip-score-high';
+    if (score >= 0.4) return 'chip-score-mid';
+    return 'chip-score-low';
+  }
+
+  function updateCount(labelName, n) {
+    const el = document.getElementById(`count-${labelName}`);
+    if (el) el.textContent = String(n);
   }
 
   // GS overlay settings
@@ -214,11 +437,9 @@ async function fetchBest() {
     try {
       const sig = sigFromData(data);
       if (sig && duplicateCounts[sig] && duplicateCounts[sig] > 0) {
-        const badge = document.createElement('div');
-        badge.style.color = '#b36b00';
-        badge.style.fontWeight = '600';
-        badge.style.marginTop = '6px';
-        badge.textContent = `Duplicates: ${duplicateCounts[sig]}`;
+        const badge = document.createElement('span');
+        badge.className = 'chip chip-dup';
+        badge.textContent = `⟳ ${duplicateCounts[sig]} duplicate${duplicateCounts[sig] === 1 ? '' : 's'}`;
         header.appendChild(badge);
       }
     } catch (e) {}
@@ -237,13 +458,19 @@ async function fetchBest() {
     const meta = document.createElement('div');
     meta.className = 'meta';
     let html = '';
-    html += '<div><strong>ID:</strong> ' + (data.assignment_id || 'N/A') + '</div>';
-    html += '<div><strong>Score:</strong> ' + (data.score !== undefined ? data.score.toFixed(3) : 'N/A') + '</div>';
-    html += '<div><strong>Source:</strong> ' + (data.model_source || 'unknown') + '</div>';
-    if (data._is_cloud_pull) {
-      html += '<div><strong>Gemini:</strong><div class="gemini-reason">' + (data.gemini_reason || 'N/A') + '</div></div>';
-    } else if (data.gemini_reason) {
-      html += '<div><strong>Gemini:</strong><div class="gemini-reason">' + data.gemini_reason + '</div></div>';
+
+    const scoreText = (data.score !== undefined && data.score !== null) ? data.score.toFixed(3) : 'N/A';
+    html += '<div class="chips">';
+    html += `<span class="chip ${scoreChipClass(data.score)}">★ ${scoreText}</span>`;
+    html += `<span class="chip chip-source">${data.model_source || 'unknown'}</span>`;
+    html += `<span class="chip chip-id">#${data.assignment_id || 'N/A'}</span>`;
+    if (typeof data.since_session_start_ms === 'number' && Number.isFinite(data.since_session_start_ms)) {
+      html += `<span class="chip chip-timing">⏱ +${fmtDuration(data.since_session_start_ms)} since first image</span>`;
+    }
+    html += '</div>';
+
+    if (data._is_cloud_pull || data.gemini_reason) {
+      html += '<div class="gemini-reason">' + (data.gemini_reason || 'N/A') + '</div>';
     }
 
     // Assignment / location details (if available)
@@ -252,12 +479,14 @@ async function fetchBest() {
       if (a) {
         if (a.telemetry) {
           const t = a.telemetry;
-          html += '<div style="margin-top:8px"><strong>Location:</strong>' +
-                  '<div>Lat: ' + (t.latitude !== undefined ? t.latitude : 'N/A') + ', Lon: ' + (t.longitude !== undefined ? t.longitude : 'N/A') + '</div>' +
-                  '<div>Alt: ' + (t.altitude !== undefined ? t.altitude : 'N/A') + ', Yaw: ' + (t.yaw !== undefined ? t.yaw : 'N/A') + '</div>' +
+          html += '<div class="loc-grid">' +
+                  '<div><span class="k">LAT</span><span class="v">' + (t.latitude !== undefined ? t.latitude : 'N/A') + '</span></div>' +
+                  '<div><span class="k">LON</span><span class="v">' + (t.longitude !== undefined ? t.longitude : 'N/A') + '</span></div>' +
+                  '<div><span class="k">ALT</span><span class="v">' + (t.altitude !== undefined ? t.altitude : 'N/A') + '</span></div>' +
+                  '<div><span class="k">YAW</span><span class="v">' + (t.yaw !== undefined ? t.yaw : 'N/A') + '</span></div>' +
                   '</div>';
         } else {
-          html += '<div class="assignment"><strong>Assignment:</strong><pre>' + JSON.stringify(a, null, 2) + '</pre></div>';
+          html += '<details class="assignment"><summary>Raw assignment</summary><pre>' + JSON.stringify(a, null, 2) + '</pre></details>';
         }
       }
     } catch (e) {}
@@ -277,14 +506,14 @@ async function fetchBest() {
         const [x1,y1,x2,y2] = data.bbox;
         const scaleX = w / img.naturalWidth;
         const scaleY = h / img.naturalHeight;
-        ctx.strokeStyle = 'red'; ctx.lineWidth = 2;
+        ctx.strokeStyle = '#34d399'; ctx.lineWidth = 2;
         ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
       }
     };
     img.onerror = () => {
-      canvas.getContext('2d').fillStyle = '#f3f3f3';
-      canvas.getContext('2d').fillRect(0,0,canvas.width,canvas.height);
-      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#888'; ctx.fillText('Image load failed', 10, 20);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1a212b'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = '#8b96a5'; ctx.font = '13px sans-serif'; ctx.fillText('Image load failed', 12, 22);
     };
     img.src = imgSrc;
 
@@ -312,6 +541,7 @@ async function fetchBest() {
 
     function appendFiltered(list, container, labelName, currentBestMeta) {
       const filtered = list.filter(e => (e.pushed === true) || (e.model_source === 'gd_backup'));
+      let renderedCount = 0;
 
       // Find the exact meta that's being sent (if present in the full list)
       let bestInList = null;
@@ -347,16 +577,21 @@ async function fetchBest() {
             // server may include inline base64 to avoid separate /export fetch
             full_image_b64: cloudBest.full_image_b64 || null,
             roi_image_b64: cloudBest.roi_image_b64 || null,
+            since_session_start_ms: cloudBest.since_session_start_ms,
             _is_cloud_pull: true,
           };
           const cloudCard = createEntryCard(labelName + ' (cloud)', cloudData, cloudBest._meta_filename || null, true);
           container.appendChild(cloudCard);
+          renderedCount++;
           // Cloud best overrides GD backup pinned entry — don't render the exported pinned entry as well
           bestInList = null;
         }
 
       if (filtered.length === 0 && !bestInList) {
-        container.innerHTML = '<div class="card empty">No ' + labelName + ' images to show</div>';
+        if (renderedCount === 0) {
+          container.innerHTML = '<div class="empty">No ' + labelName + ' images to show</div>';
+        }
+        updateCount(labelName, renderedCount);
         return;
       }
 
@@ -365,6 +600,7 @@ async function fetchBest() {
         const idx = filtered.findIndex(e => (e._meta_filename || null) === currentBestMeta);
         if (idx >= 0) filtered.splice(idx, 1);
         container.appendChild(createEntryCard(labelName, bestInList, bestInList._meta_filename || null, true));
+        renderedCount++;
       }
 
       // Render the remainder (non-highlighted)
@@ -374,7 +610,9 @@ async function fetchBest() {
           continue;
         }
         container.appendChild(createEntryCard(labelName, e, e._meta_filename || null, false));
+        renderedCount++;
       }
+      updateCount(labelName, renderedCount);
     }
 
     appendFiltered(tentList, tentLog, 'tent', currentBestTent);
@@ -385,8 +623,9 @@ async function fetchBest() {
     gsPanel.innerHTML = '';
     try {
       const gsList = best.gs || [];
+      updateCount('gs', gsList.length);
       if (gsList.length === 0) {
-        gsPanel.innerHTML = '<div class="gs-card empty">No recent ground-station pulls</div>';
+        gsPanel.innerHTML = '<div class="empty">No recent ground-station pulls</div>';
       } else {
         const latest = gsList[0];
         // Build a minimal GS card: image + assignment only
@@ -412,30 +651,19 @@ async function fetchBest() {
           drawGsGridOverlay(ctx, w, h, latest.assignment || null);
         };
         img.onerror = () => {
-          const ctx = canvas.getContext('2d'); ctx.fillStyle = '#f3f3f3'; ctx.fillRect(0,0,canvas.width,canvas.height);
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#1a212b'; ctx.fillRect(0,0,canvas.width,canvas.height);
         };
         img.src = `${API_BASE}/export/` + (latest.full_image || '');
 
         // Grid legend (key)
         const legendDiv = document.createElement('div');
-        legendDiv.style.marginTop = '8px';
-        legendDiv.style.fontSize = '13px';
-        legendDiv.style.color = '#333';
-        legendDiv.style.background = '#f7f7f7';
-        legendDiv.style.border = '1px solid #e2e2e2';
-        legendDiv.style.borderRadius = '4px';
-        legendDiv.style.padding = '8px';
+        legendDiv.className = 'gs-legend';
         legendDiv.innerHTML =
-          '<div style="font-weight:600; margin-bottom:6px">Key</div>' +
-          '<div style="display:flex; align-items:center; gap:18px; flex-wrap:wrap">' +
-            '<div style="display:flex; align-items:center; gap:8px">' +
-              '<span style="display:inline-block; width:28px; border-top:2px solid rgba(0, 180, 255, 0.85)"></span>' +
-              '<span>Blue lines: every ' + GS_GRID_SPACING_METERS + ' m on ground</span>' +
-            '</div>' +
-            '<div style="display:flex; align-items:center; gap:8px">' +
-              '<span style="display:inline-block; width:28px; border-top:2px solid rgba(255, 215, 0, 0.95)"></span>' +
-              '<span>Yellow lines: image center crosshair</span>' +
-            '</div>' +
+          '<div class="legend-title">Key</div>' +
+          '<div class="legend-row">' +
+            '<div><span class="legend-swatch" style="border-color:rgba(0,180,255,0.85)"></span>Every ' + GS_GRID_SPACING_METERS + ' m on ground</div>' +
+            '<div><span class="legend-swatch" style="border-color:rgba(255,215,0,0.95)"></span>Image center crosshair</div>' +
           '</div>';
         card.appendChild(legendDiv);
 
@@ -445,37 +673,34 @@ async function fetchBest() {
           const lat = telemetry ? telemetry.lat : null;
           const lon = telemetry ? telemetry.lon : null;
           const altitude = telemetry ? telemetry.altitude : null;
-          
+
           const locDiv = document.createElement('div');
-          locDiv.style.marginTop = '12px';
-          locDiv.style.padding = '8px';
-          locDiv.style.background = '#f0f0f0';
-          locDiv.style.borderRadius = '4px';
-          locDiv.innerHTML = '<strong>Location</strong>' +
-                             '<div style="display:flex; gap:24px; margin-top:8px">' +
-                               '<div style="font-size:50px; font-weight:600;">' +
-                                 '<div style="font-size:15px; font-weight:400; color:#666; margin-bottom:2px">LAT</div>' +
-                                 (lat !== null ? lat.toFixed(6) : 'N/A') +
+          locDiv.className = 'gs-loc';
+          locDiv.innerHTML = '<div class="label-sm">Location</div>' +
+                             '<div class="hero-row">' +
+                               '<div>' +
+                                 '<div class="hero-key">LAT</div>' +
+                                 '<div class="hero-val">' + (lat !== null ? lat.toFixed(6) : 'N/A') + '</div>' +
                                '</div>' +
-                               '<div style="font-size:50px; font-weight:600;">' +
-                                 '<div style="font-size:15px; font-weight:400; color:#666; margin-bottom:2px">LON</div>' +
-                                 (lon !== null ? lon.toFixed(6) : 'N/A') +
+                               '<div>' +
+                                 '<div class="hero-key">LON</div>' +
+                                 '<div class="hero-val">' + (lon !== null ? lon.toFixed(6) : 'N/A') + '</div>' +
                                '</div>' +
                              '</div>' +
-                             '<div style="font-size:13px; margin-top:6px; color:#555;">Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '</div>';
+                             '<div class="alt-row">Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '</div>';
           card.appendChild(locDiv);
         } catch (e) { console.error('Error rendering location:', e); }
 
         // Assignment block (minimal)
         const assignDiv = document.createElement('div');
         assignDiv.className = 'assignment';
-        assignDiv.innerHTML = '<strong>Assignment</strong><pre>' + JSON.stringify(latest.assignment || {}, null, 2) + '</pre>';
+        assignDiv.innerHTML = '<details><summary>Raw assignment</summary><pre>' + JSON.stringify(latest.assignment || {}, null, 2) + '</pre></details>';
         card.appendChild(assignDiv);
 
         gsPanel.appendChild(card);
       }
     } catch (e) {
-      gsPanel.innerHTML = '<div class="gs-card empty">Error loading GS image</div>';
+      gsPanel.innerHTML = '<div class="empty">Error loading GS image</div>';
     }
   }
 
@@ -504,8 +729,8 @@ async function fetchBest() {
   } catch (e) { console.warn('Grid spacing control unavailable', e); }
 
   // Admin actions: clear cloud server / delete local saved images
-  async function runAdminCommand(command, confirmMessage, button) {
-    if (!confirm(confirmMessage)) return;
+  async function runAdminCommand(command, confirmMessage, button, { refreshOnSuccess = true } = {}) {
+    if (confirmMessage && !confirm(confirmMessage)) return;
     const statusEl = document.getElementById('admin-status');
     statusEl.className = 'action-status';
     statusEl.textContent = 'Working...';
@@ -520,7 +745,7 @@ async function fetchBest() {
       if (res.ok && data.status === 'success') {
         statusEl.className = 'action-status success';
         statusEl.textContent = data.message || 'Done';
-        refresh();
+        if (refreshOnSuccess) refresh();
       } else {
         statusEl.className = 'action-status error';
         statusEl.textContent = data.message || `Request failed (${res.status})`;
@@ -531,6 +756,13 @@ async function fetchBest() {
     } finally {
       button.disabled = false;
     }
+  }
+
+  const btnCheckCloud = document.getElementById('btn-check-cloud');
+  if (btnCheckCloud) {
+    btnCheckCloud.addEventListener('click', () => {
+      runAdminCommand('check_cloud', null, btnCheckCloud, { refreshOnSuccess: false });
+    });
   }
 
   const btnClearCloud = document.getElementById('btn-clear-cloud');
@@ -560,6 +792,8 @@ async function fetchBest() {
 
   // Live updates via Server-Sent Events: refresh on GS pulls or other events
   try {
+    const sseDot = document.getElementById('sse-dot');
+    const sseLabel = document.getElementById('sse-label');
     const es = new EventSource(`${API_BASE}/api/stream`);
     es.addEventListener('gs_pull', (e) => {
       try { refresh(); } catch (err) { console.error('refresh failed', err); }
@@ -574,8 +808,16 @@ async function fetchBest() {
         try { refresh(); } catch (err) {}
       } catch (err) { console.error('duplicate event parse', err); }
     });
-    es.onopen = () => console.log('SSE connected');
-    es.onerror = (err) => console.warn('SSE error', err);
+    es.onopen = () => {
+      console.log('SSE connected');
+      if (sseDot) { sseDot.className = 'status-dot ok'; }
+      if (sseLabel) { sseLabel.textContent = 'live'; }
+    };
+    es.onerror = (err) => {
+      console.warn('SSE error', err);
+      if (sseDot) { sseDot.className = 'status-dot err'; }
+      if (sseLabel) { sseLabel.textContent = 'reconnecting…'; }
+    };
   } catch (e) {
     console.warn('SSE not available');
   }

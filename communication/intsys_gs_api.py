@@ -475,6 +475,7 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
                                     cloud_mannequin['full_image'] = full_fname if full_fname else None
                                     cloud_mannequin['roi_image'] = roi_fname if roi_fname else None
+                                    cloud_mannequin['since_session_start_ms'] = _m.get('since_session_start_ms')
                                     # Attach base64 image data for frontend convenience
                                     try:
                                         if full_fname and (EXPORT_DIR / full_fname).exists():
@@ -559,6 +560,7 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
                                     cloud_tent['full_image'] = full_fname if full_fname else None
                                     cloud_tent['roi_image'] = roi_fname if roi_fname else None
+                                    cloud_tent['since_session_start_ms'] = _m.get('since_session_start_ms')
                                     # Attach base64 image data for frontend convenience
                                     try:
                                         if full_fname and (EXPORT_DIR / full_fname).exists():
@@ -723,6 +725,31 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 else:
                     self.mapper.trigger_pipeline()
                     response = {"status": "success", "message": "Mapping triggered"}
+            elif command == 'check_cloud':
+                try:
+                    work_client = getattr(self.mapper, 'work_client', None)
+                    if work_client is None:
+                        response = {"status": "error", "message": "work_client not available"}
+                    else:
+                        status = work_client.check_cloud_saved()
+
+                        def _fmt(v):
+                            if v is True:
+                                return "saved"
+                            if v is False:
+                                return "empty"
+                            return "unknown (request failed)"
+
+                        message = f"Tent: {_fmt(status.get('tent'))} · Mannequin: {_fmt(status.get('mannequin'))}"
+                        response = {
+                            "status": "success",
+                            "message": message,
+                            "tent_saved": status.get('tent'),
+                            "mannequin_saved": status.get('mannequin'),
+                        }
+                except Exception as e:
+                    response = {"status": "error", "message": f"Failed to check cloud status: {e}"}
+                    print_red(f"[api] check_cloud failed: {e}")
             elif command == 'clear_cloud':
                 try:
                     work_client = getattr(self.mapper, 'work_client', None)

@@ -278,6 +278,13 @@ class VisionClient:
         self._gd_best_mannequin: tuple = None  # (assignment, ROI, Classification)
         self._gd_best_tent: tuple = None        # (assignment, ROI, Classification)
 
+        # "Session start" (T0): receive-timestamp of the first image pulled while
+        # EXPORT_DIR was empty. Re-established any time the folder empties again
+        # (e.g. after a "clear_exports" command), since request_image() re-checks
+        # disk state on every pull rather than latching a one-time flag.
+        self._session_start_ts: int = None
+        self._session_start_lock = threading.Lock()
+
     def _result_scheduler_loop(self):
         while True:
             remaining = int(self.result_interval_seconds)
@@ -521,6 +528,7 @@ class VisionClient:
                         _os.replace(tmp_roi, str(roi_fn))
                     except Exception:
                         pass
+                    session_start_ts, since_session_start_ms = self._since_session_start(ts)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
@@ -533,6 +541,8 @@ class VisionClient:
                         "roi_image": str(roi_fn.name),
                         "bbox": list(roi.top_left) + list(roi.bottom_right),
                         "pushed": True,
+                        "session_start_ts": session_start_ts,
+                        "since_session_start_ms": since_session_start_ms,
                     }
                     try:
                         import os as _os
@@ -631,6 +641,7 @@ class VisionClient:
                             import os as _os
                             meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                             tmp_meta = str(meta_fn) + '.tmp'
+                            session_start_ts, since_session_start_ms = self._since_session_start(ts)
                             with open(tmp_meta, 'w') as _mf:
                                 json.dump({
                                     "timestamp": ts,
@@ -644,6 +655,8 @@ class VisionClient:
                                     "roi_image": str(roi_fn.name),
                                     "bbox": list(roi.top_left) + list(roi.bottom_right),
                                     "pushed": True,
+                                    "session_start_ts": session_start_ts,
+                                    "since_session_start_ms": since_session_start_ms,
                                 }, _mf)
                                 _mf.flush()
                                 _os.fsync(_mf.fileno())
@@ -709,6 +722,18 @@ class VisionClient:
             if not _ensure_export_dir():
                 raise RuntimeError("export directory unavailable")
             ts = int(time.time() * 1000)
+
+            # Establish (or re-establish) T0: the receive-time of the first
+            # image pulled while EXPORT_DIR was empty. Re-checked on every
+            # pull (not a one-time flag) so it re-baselines after a
+            # "clear_exports" wipes the folder.
+            try:
+                if not any(EXPORT_DIR.iterdir()):
+                    with self._session_start_lock:
+                        self._session_start_ts = ts
+            except Exception:
+                pass
+
             aid = self.assignment.get('id') if self.assignment else 'noid'
             full_fn = EXPORT_DIR / f"full_gs_{aid}_{ts}.jpg"
             try:
@@ -759,6 +784,16 @@ class VisionClient:
         except Exception as e:
             print_red(f"[cloud] Image upload failed: {e}")
     
+    def _since_session_start(self, ts: int):
+        """Return (session_start_ts, since_session_start_ms) for a classification
+        made at time `ts`, or (None, None) if T0 hasn't been established yet
+        (no image has been pulled into an empty EXPORT_DIR this session)."""
+        with self._session_start_lock:
+            t0 = self._session_start_ts
+        if t0 is None:
+            return None, None
+        return t0, ts - t0
+
     def gd_backup(self):
         """Run GroundingDINO on the current image and cache the highest-scoring
         candidate for each of MANNEQUIN and TENT as a fallback in case the
@@ -839,6 +874,7 @@ class VisionClient:
                     pass
                 # Write metadata sidecar JSON
                 try:
+                    session_start_ts, since_session_start_ms = self._since_session_start(ts)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
@@ -852,6 +888,8 @@ class VisionClient:
                         "bbox": list(roi.top_left) + list(roi.bottom_right),
                             # Mark that this is a GD backup candidate (not a cloud push)
                             "pushed": False,
+                            "session_start_ts": session_start_ts,
+                            "since_session_start_ms": since_session_start_ms,
                     }
                     meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                     with open(meta_fn, "w") as mf:
@@ -893,6 +931,7 @@ class VisionClient:
                 except Exception:
                     pass
                 try:
+                    session_start_ts, since_session_start_ms = self._since_session_start(ts)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
@@ -906,6 +945,8 @@ class VisionClient:
                         "bbox": list(roi.top_left) + list(roi.bottom_right),
                         # Mark that this is a GD backup candidate (not a cloud push)
                         "pushed": False,
+                        "session_start_ts": session_start_ts,
+                        "since_session_start_ms": since_session_start_ms,
                     }
                     meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                     with open(meta_fn, "w") as mf:
