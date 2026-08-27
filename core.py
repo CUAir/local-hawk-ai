@@ -96,6 +96,9 @@ MAPPING_OUTPUT_DIR  = Path(__file__).parent / "mapping" / "outputs"
 MAPPING_CSV_PATH    = MAPPING_SESSION_DIR / "metadata.csv"
 IDLE_MAPPING_TIMEOUT_SECONDS = 20
 IDLE_MAPPING_POLL_SECONDS = 1
+# How often to ask the cloud whether its mapping run has finished. Cloud stitches
+# take minutes, so this is deliberately slower than the idle monitor's 1s tick.
+CLOUD_MAP_POLL_SECONDS = 15
 
 
 # Mapping Helper Functions (mirrors hawk-ai/main.py, adapted for PIL images) --------
@@ -210,6 +213,13 @@ class Mapper:
         self.last_image_received_ts = time.time()
         self.last_auto_trigger_ts = 0.0
 
+        # Cloud mapping mirror state. cloud_mapping_result is the local path of
+        # the most recently downloaded cloud map; _seen_cloud_results tracks the
+        # cloud-side paths we have already pulled so a steady-state poll does not
+        # re-download the same map every tick.
+        self.cloud_mapping_result = None
+        self._seen_cloud_results = set()
+
     def trigger_pipeline(self):
         """Trigger the hawk-ai GpsSiftPipeline in a background thread."""
         if self.mapping_running:
@@ -221,6 +231,52 @@ class Mapper:
     def mark_image_received(self):
         """Record timestamp of the latest received image."""
         self.last_image_received_ts = time.time()
+
+    def poll_cloud_map_once(self):
+        """Pull the cloud orthomosaic down once a cloud run has finished.
+
+        Saved alongside the locally-produced maps in MAPPING_OUTPUT_DIR under the
+        cloud's own filename with `_cloud` appended, so `map_<date>.jpg` on the
+        cloud lands here as `map_<date>_cloud.jpg` and sorts next to the local
+        map from the same flight.
+
+        Only downloads once the cloud reports `running: false` — mapping_result
+        is set before the run flips that flag back, so pulling while it is still
+        true can fetch the *previous* flight's map.
+        """
+        cloud_status = self.work_client.get_cloud_mapping_status()
+        if not cloud_status:
+            return
+
+        if cloud_status.get("running"):
+            return
+
+        remote_path = cloud_status.get("last_result")
+        if not remote_path or remote_path in self._seen_cloud_results:
+            return
+
+        remote_name = Path(remote_path).name
+        if not remote_name:
+            return
+
+        stem = Path(remote_name).stem
+        suffix = Path(remote_name).suffix or ".jpg"
+        dest = MAPPING_OUTPUT_DIR / f"{stem}_cloud{suffix}"
+
+        # Mark as seen up front: on a persistent failure we would otherwise
+        # retry this same map on every tick for the rest of the flight.
+        self._seen_cloud_results.add(remote_path)
+
+        if dest.exists():
+            print(f"[mapping] Cloud map already present locally → {dest}")
+            self.cloud_mapping_result = str(dest)
+            return
+
+        print_green(f"[mapping] Cloud run finished ({remote_name}) — downloading...")
+        if self.work_client.download_cloud_mapping_result(dest):
+            self.cloud_mapping_result = str(dest)
+        else:
+            print_yellow(f"[mapping] Could not download cloud map {remote_name}")
 
     def maybe_trigger_pipeline_on_idle(self, timeout_seconds: float = IDLE_MAPPING_TIMEOUT_SECONDS):
         """
@@ -1019,6 +1075,21 @@ def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
             print_yellow(f"[mapping] Idle monitor error: {e}")
         time.sleep(IDLE_MAPPING_POLL_SECONDS)
 
+def cloud_map_monitor_loop(mapper: Mapper, interval_seconds: float):
+    """Background loop that mirrors finished cloud orthomosaics onto this machine.
+
+    Runs independently of the local mapping pipeline — the cloud may be asked to
+    stitch by anyone, so we watch its status rather than assuming we triggered it.
+    """
+    header(f"\n[mapping] Cloud map monitor started (poll={interval_seconds}s)")
+    while True:
+        try:
+            mapper.poll_cloud_map_once()
+        except Exception as e:
+            print_yellow(f"[mapping] Cloud map monitor error: {e}")
+        time.sleep(interval_seconds)
+
+
 def main(
     gs_ip_address: str,
     cs_ip_address: str,
@@ -1060,6 +1131,13 @@ def main(
         ).start()
     else:
         print_yellow("[mapping] Auto-trigger disabled; waiting for explicit trigger_mapping requests")
+
+    # Mirror finished cloud orthomosaics into MAPPING_OUTPUT_DIR as <name>_cloud.jpg
+    threading.Thread(
+        target=cloud_map_monitor_loop,
+        args=(mapper, CLOUD_MAP_POLL_SECONDS),
+        daemon=True,
+    ).start()
 
     # Wait until the server has bound the port (or timeout)
     def _wait_for_port(host: str, port: int, timeout: float = 3.0) -> bool:
