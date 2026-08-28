@@ -431,6 +431,7 @@ def _parse_result_payload(data: dict):
 class MapCommandHandler(BaseHTTPRequestHandler):
     mapper = None
     result_store: ResultStore = None
+    vision_client = None
     # e.g. "http://192.168.1.10:8000". None => capture controls disabled and no
     # socket is ever opened toward the aircraft.
     mps_base_url = None
@@ -1213,6 +1214,15 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     response = {"status": "error", "message": f"Failed to clear cloud: {e}"}
                     print_red(f"[api] clear_cloud failed: {e}")
+            elif command == 'send_to_autopilot':
+                meta_filename = data.get('meta_filename')
+                vision_client = getattr(self, 'vision_client', None)
+                if vision_client is None:
+                    response = {"status": "error", "message": "Vision client not ready yet"}
+                elif not meta_filename:
+                    response = {"status": "error", "message": "meta_filename is required"}
+                else:
+                    response = vision_client.send_meta_to_autopilot(meta_filename)
             elif command == 'clear_exports':
                 try:
                     deleted = 0
