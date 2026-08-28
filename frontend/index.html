@@ -215,6 +215,7 @@
     .skeleton { color: var(--muted); text-align:center; font-size:12.5px; padding: 22px 10px; }
 
     .card-actions { margin-top: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+    .card-actions-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .card-status {
       font-size: 11.5px; color: var(--muted);
       max-height: 4.5em; overflow-y: auto; width: 100%;
@@ -432,36 +433,70 @@ async function fetchBest() {
     meta.innerHTML = html;
     card.appendChild(meta);
 
+    const hasBbox = !!(data.bbox && data.bbox.length === 4);
+
     const actions = document.createElement('div');
     actions.className = 'card-actions';
+    const buttonRow = document.createElement('div');
+    buttonRow.className = 'card-actions-row';
+    const viewBtn = document.createElement('button');
+    viewBtn.className = 'btn';
+    viewBtn.textContent = 'View Crop';
+    viewBtn.disabled = !hasBbox;
+    buttonRow.appendChild(viewBtn);
     const sendBtn = document.createElement('button');
     sendBtn.className = 'btn btn-info';
     sendBtn.textContent = 'Send to Autopilot';
     sendBtn.disabled = !metaFilename;
-    actions.appendChild(sendBtn);
+    buttonRow.appendChild(sendBtn);
+    actions.appendChild(buttonRow);
     const statusSpan = document.createElement('span');
     statusSpan.className = 'card-status';
     actions.appendChild(statusSpan);
     card.appendChild(actions);
     sendBtn.addEventListener('click', () => sendToAutopilot(metaFilename, sendBtn, statusSpan));
 
-    // Load image and draw bbox
+    // Load image once, then redraw() switches between the full image (with
+    // bbox overlay) and a zoomed-in crop of just the bbox region, without
+    // re-fetching the image.
     const img = new Image();
-    img.onload = () => {
+    let imgLoaded = false;
+    let viewMode = 'full';
+
+    function redraw() {
+      if (!imgLoaded) return;
       const ctx = canvas.getContext('2d');
-      const ratio = img.naturalWidth / img.naturalHeight;
-      const w = Math.min(800, img.naturalWidth);
-      const h = Math.round(w / ratio);
-      canvas.width = w; canvas.height = h;
-      ctx.drawImage(img, 0, 0, w, h);
-      if (data.bbox && data.bbox.length === 4) {
-        const [x1,y1,x2,y2] = data.bbox;
-        const scaleX = w / img.naturalWidth;
-        const scaleY = h / img.naturalHeight;
-        ctx.strokeStyle = '#ff0000'; ctx.lineWidth = 5;
-        ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
+      if (viewMode === 'crop' && hasBbox) {
+        const [x1, y1, x2, y2] = data.bbox;
+        const cropW = Math.max(1, x2 - x1), cropH = Math.max(1, y2 - y1);
+        const ratio = cropW / cropH;
+        const w = Math.min(800, Math.max(cropW, 400));
+        const h = Math.round(w / ratio);
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(img, x1, y1, cropW, cropH, 0, 0, w, h);
+      } else {
+        const ratio = img.naturalWidth / img.naturalHeight;
+        const w = Math.min(800, img.naturalWidth);
+        const h = Math.round(w / ratio);
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(img, 0, 0, w, h);
+        if (hasBbox) {
+          const [x1, y1, x2, y2] = data.bbox;
+          const scaleX = w / img.naturalWidth;
+          const scaleY = h / img.naturalHeight;
+          ctx.strokeStyle = '#ff0000'; ctx.lineWidth = 5;
+          ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
+        }
       }
-    };
+    }
+
+    viewBtn.addEventListener('click', () => {
+      viewMode = viewMode === 'full' ? 'crop' : 'full';
+      viewBtn.textContent = viewMode === 'full' ? 'View Crop' : 'View Full Image';
+      redraw();
+    });
+
+    img.onload = () => { imgLoaded = true; redraw(); };
     img.onerror = () => {
       const ctx = canvas.getContext('2d');
       ctx.fillStyle = '#1a212b'; ctx.fillRect(0,0,canvas.width,canvas.height);
