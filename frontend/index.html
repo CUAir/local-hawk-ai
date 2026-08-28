@@ -82,7 +82,7 @@
     /* Board layout */
     .board {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr);
       gap: 18px;
       padding: 18px 20px 28px;
       align-items: start;
@@ -98,7 +98,7 @@
     .col-title::before { content: ''; width: 8px; height: 8px; border-radius: 2px; display:inline-block; }
     .col-title.tent::before { background: var(--amber); }
     .col-title.mannequin::before { background: var(--purple); }
-    .col-title.gs::before { background: var(--blue); }
+    .col-title.best::before { background: var(--blue); }
     .count-badge {
       font-family: var(--mono); font-size: 11.5px; color: var(--muted);
       background: var(--surface-2); border: 1px solid var(--border);
@@ -106,6 +106,35 @@
     }
 
     .log { max-height: calc(100vh - 200px); overflow-y: auto; padding-right: 4px; }
+
+    /* Best column: exactly 0-2 cards, never scrolls — the cards shrink to
+       fit whatever vertical space is available instead. */
+    .best-col { display: flex; flex-direction: column; height: calc(100vh - 200px); }
+    .best-col .col-head { flex: 0 0 auto; }
+    #best-panel {
+      flex: 1 1 auto; min-height: 0;
+      display: flex; flex-direction: column; gap: 12px;
+      overflow: hidden;
+    }
+    #best-panel .card {
+      flex: 1 1 0; min-height: 0; margin-bottom: 0;
+      display: grid;
+      grid-template-columns: 1fr 220px;
+      grid-template-rows: auto 1fr auto;
+      column-gap: 12px;
+      overflow: hidden;
+    }
+    /* Image takes the whole left column, spanning full card height */
+    #best-panel .card > canvas.entry-canvas {
+      grid-column: 1; grid-row: 1 / span 3;
+      min-width: 0; min-height: 0;
+      width: 100%; height: 100%; object-fit: contain;
+    }
+    /* Timestamp/duplicate-badge header, chips+location, and the Send to
+       Autopilot button all stack in a narrow right-hand column instead. */
+    #best-panel .card > div:first-child { grid-column: 2; grid-row: 1; min-width: 0; }
+    #best-panel .card > .meta { grid-column: 2; grid-row: 2; min-width: 0; min-height: 0; margin-top: 6px; overflow: hidden; }
+    #best-panel .card > .card-actions { grid-column: 2; grid-row: 3; min-width: 0; }
 
     .card {
       border: 1px solid var(--border); border-radius: 10px;
@@ -182,44 +211,17 @@
     }
     .skeleton { color: var(--muted); text-align:center; font-size:12.5px; padding: 22px 10px; }
 
-    /* GS column */
-    .gs-controls {
-      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-      font-size: 12px; color: var(--muted); margin-bottom: 10px;
+    .card-actions { margin-top: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+    .card-status {
+      font-size: 11.5px; color: var(--muted);
+      max-height: 4.5em; overflow-y: auto; width: 100%;
     }
-    .control { display: flex; align-items: center; gap: 6px; }
-    .control select {
-      background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
-      border-radius: 5px; padding: 4px 6px; font-size: 12px; font-family: var(--sans);
-    }
-    .control.checkbox { user-select: none; cursor: pointer; }
-    .control input[type="checkbox"] { accent-color: var(--accent); }
-
-    .gs-card {
-      border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 12px;
-    }
-    .gs-legend {
-      margin-top: 10px; font-size: 12px; color: var(--muted);
-      background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-    }
-    .gs-legend .legend-title { font-weight: 650; color: var(--text); margin-bottom: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
-    .gs-legend .legend-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
-    .legend-swatch { display: inline-block; width: 22px; border-top: 2px solid; margin-right: 6px; vertical-align: middle; }
-
-    .gs-loc {
-      margin-top: 12px; padding: 12px; background: var(--surface-2); border-radius: 8px;
-      border: 1px solid var(--border);
-    }
-    .gs-loc .label-sm { font-size: 10.5px; color: var(--muted); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
-    .gs-loc .hero-row { display: flex; gap: 26px; margin-top: 8px; flex-wrap: wrap; }
-    .gs-loc .hero-val { font-family: var(--mono); font-size: 28px; font-weight: 650; color: var(--text); line-height: 1; }
-    .gs-loc .hero-key { font-size: 11px; color: var(--muted); margin-bottom: 4px; letter-spacing: .05em; }
-    .gs-loc .alt-row { font-size: 12px; margin-top: 8px; color: var(--muted); font-family: var(--mono); }
+    .card-status.status-success { color: var(--accent); }
+    .card-status.status-error { color: var(--red); }
 
     @media (max-width: 720px) {
       .topbar { padding: 12px 14px; }
       .board { padding: 14px; grid-template-columns: 1fr; }
-      .gs-loc .hero-val { font-size: 22px; }
     }
   </style>
 </head>
@@ -230,7 +232,7 @@
         <span class="brand-dot"></span>
         <h1>Local Hawk AI — Live Results</h1>
       </div>
-      <p class="subtitle">Most recent tent &amp; mannequin detections (cloud push or local GD backup), plus the latest raw ground-station pull.</p>
+      <p class="subtitle">Most recent tent &amp; mannequin detections (cloud push or local GD backup). Autopilot sends are manual — press "Send to Autopilot" on a card to send it.</p>
     </div>
     <div class="topbar-right">
       <div class="conn-status">
@@ -264,28 +266,12 @@
       <div class="log" id="log-mannequin"><div class="skeleton">Loading…</div></div>
     </section>
 
-    <section aria-label="Ground station pulls">
+    <section class="best-col" aria-label="Best detections">
       <div class="col-head">
-        <span class="col-title gs">Ground Station</span>
-        <span class="count-badge" id="count-gs">0</span>
+        <span class="col-title best">Best</span>
+        <span class="count-badge" id="count-best">0</span>
       </div>
-      <div class="gs-controls">
-        <label class="control">
-          <span>Grid</span>
-          <select id="gs-grid-spacing">
-            <option value="5">5 m</option>
-            <option value="10" selected>10 m</option>
-            <option value="25">25 m</option>
-            <option value="50">50 m</option>
-            <option value="100">100 m</option>
-          </select>
-        </label>
-        <label class="control checkbox">
-          <input id="gs-show-crosshair" type="checkbox" checked />
-          <span>Crosshair</span>
-        </label>
-      </div>
-      <div class="log" id="gs-panel"><div class="skeleton">Loading…</div></div>
+      <div id="best-panel"><div class="skeleton">Loading…</div></div>
     </section>
   </main>
 
@@ -340,91 +326,32 @@ async function fetchBest() {
     if (el) el.textContent = String(n);
   }
 
-  // GS overlay settings
-  let GS_GRID_SPACING_METERS = 10; // configurable grid spacing
-  let GS_SHOW_CROSSHAIR = true;
-  const GS_DEFAULT_FOV_X_RAD = 0.3069;
-  const GS_DEFAULT_FOV_Y_RAD = 0.2046;
 
-  function asFiniteNumber(v) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  function getAssignmentImageTelemetry(assignment) {
-    // Newer schema: assignment.image.telemetry.gps.latitude/longitude
-    // Legacy schema fallback: assignment.telemetry.latitude/longitude
-    const imgTelem = assignment && assignment.image && assignment.image.telemetry ? assignment.image.telemetry : null;
-    const legacyTelem = assignment && assignment.telemetry ? assignment.telemetry : null;
-    const telemetry = imgTelem || legacyTelem;
-    if (!telemetry) return null;
-
-    const lat = asFiniteNumber(telemetry.gps && telemetry.gps.latitude !== undefined ? telemetry.gps.latitude : telemetry.latitude);
-    const lon = asFiniteNumber(telemetry.gps && telemetry.gps.longitude !== undefined ? telemetry.gps.longitude : telemetry.longitude);
-    const altitude = asFiniteNumber(telemetry.altitude);
-    return { lat, lon, altitude };
-  }
-
-  function getAssignmentImageFov(assignment) {
-    const f = assignment && assignment.image && assignment.image.fov ? assignment.image.fov : null;
-    const x = asFiniteNumber(f && f.x);
-    const y = asFiniteNumber(f && f.y);
-    return {
-      x: x && x > 0 ? x : GS_DEFAULT_FOV_X_RAD,
-      y: y && y > 0 ? y : GS_DEFAULT_FOV_Y_RAD,
-    };
-  }
-
-  function drawGsGridOverlay(ctx, w, h, assignment) {
-    if (GS_GRID_SPACING_METERS <= 0) return;
-    const telemetry = getAssignmentImageTelemetry(assignment);
-    if (!telemetry || telemetry.altitude === null || telemetry.altitude <= 0) return;
-
-    const fov = getAssignmentImageFov(assignment);
-    const groundWidthMeters = 2 * telemetry.altitude * Math.tan(fov.x / 2);
-    const groundHeightMeters = 2 * telemetry.altitude * Math.tan(fov.y / 2);
-    if (!Number.isFinite(groundWidthMeters) || !Number.isFinite(groundHeightMeters) || groundWidthMeters <= 0 || groundHeightMeters <= 0) return;
-
-    const pxPerMeterX = w / groundWidthMeters;
-    const pxPerMeterY = h / groundHeightMeters;
-    const stepX = GS_GRID_SPACING_METERS * pxPerMeterX;
-    const stepY = GS_GRID_SPACING_METERS * pxPerMeterY;
-    if (!Number.isFinite(stepX) || !Number.isFinite(stepY) || stepX < 4 || stepY < 4) return;
-
-    ctx.save();
-    ctx.strokeStyle = 'rgba(0, 180, 255, 0.55)';
-    ctx.lineWidth = 1;
-
-    // Draw vertical lines centered on image midpoint
-    const cx = w / 2, cy = h / 2;
-    for (let x = cx; x <= w; x += stepX) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  async function sendToAutopilot(metaFilename, button, statusEl) {
+    if (!metaFilename) return;
+    statusEl.className = 'card-status';
+    statusEl.textContent = 'Sending…';
+    button.disabled = true;
+    try {
+      const res = await fetch(`${API_BASE}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'send_to_autopilot', meta_filename: metaFilename }),
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'success') {
+        statusEl.className = 'card-status status-success';
+        statusEl.textContent = '✓ ' + (data.message || 'Sent');
+      } else {
+        statusEl.className = 'card-status status-error';
+        statusEl.textContent = data.message || `Failed (${res.status})`;
+      }
+    } catch (e) {
+      statusEl.className = 'card-status status-error';
+      statusEl.textContent = `Failed: ${e}`;
+    } finally {
+      button.disabled = false;
     }
-    for (let x = cx - stepX; x >= 0; x -= stepX) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-    }
-    // Draw horizontal lines centered on image midpoint
-    for (let y = cy; y <= h; y += stepY) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-    }
-    for (let y = cy - stepY; y >= 0; y -= stepY) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-    }
-
-    // Optional image center crosshair
-    if (GS_SHOW_CROSSHAIR) {
-      ctx.strokeStyle = 'rgba(255, 215, 0, 0.8)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(w / 2, 0);
-      ctx.lineTo(w / 2, h);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, h / 2);
-      ctx.lineTo(w, h / 2);
-      ctx.stroke();
-    }
-    ctx.restore();
   }
 
   function createEntryCard(label, data, metaFilename, isBest) {
@@ -493,6 +420,19 @@ async function fetchBest() {
     meta.innerHTML = html;
     card.appendChild(meta);
 
+    const actions = document.createElement('div');
+    actions.className = 'card-actions';
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'btn btn-info';
+    sendBtn.textContent = 'Send to Autopilot';
+    sendBtn.disabled = !metaFilename;
+    actions.appendChild(sendBtn);
+    const statusSpan = document.createElement('span');
+    statusSpan.className = 'card-status';
+    actions.appendChild(statusSpan);
+    card.appendChild(actions);
+    sendBtn.addEventListener('click', () => sendToAutopilot(metaFilename, sendBtn, statusSpan));
+
     // Load image and draw bbox
     const img = new Image();
     img.onload = () => {
@@ -506,7 +446,7 @@ async function fetchBest() {
         const [x1,y1,x2,y2] = data.bbox;
         const scaleX = w / img.naturalWidth;
         const scaleY = h / img.naturalHeight;
-        ctx.strokeStyle = '#34d399'; ctx.lineWidth = 2;
+        ctx.strokeStyle = '#ff0000'; ctx.lineWidth = 5;
         ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
       }
     };
@@ -520,13 +460,64 @@ async function fetchBest() {
     return card;
   }
 
+  // Stable identity for a card across refreshes, so unchanged entries can
+  // reuse their existing DOM node (and its already-loaded image/canvas)
+  // instead of being torn down and rebuilt — that rebuild-every-refresh
+  // churn is what caused the dashboard's image flicker.
+  function cardKey(labelName, metaFilename, data) {
+    if (metaFilename) return metaFilename;
+    const sig = sigFromData(data);
+    return `cloud:${labelName}:${sig || 'unknown'}`;
+  }
+
+  // Reconcile `container`'s children to match `desired` (an ordered list of
+  // {key, label, data, metaFilename, isBest}), reusing existing card elements
+  // keyed by `cardKey` wherever possible instead of recreating them.
+  function reconcileCards(container, desired) {
+    const existing = new Map();
+    for (const child of Array.from(container.children)) {
+      if (child.dataset && child.dataset.key) existing.set(child.dataset.key, child);
+    }
+    const used = new Set();
+    let prevNode = null;
+    for (const entry of desired) {
+      let node = existing.get(entry.key);
+      if (node) {
+        // Same underlying detection already rendered — just sync the
+        // highlight state, leave the image/canvas alone.
+        node.className = 'card' + (entry.isBest ? ' highlight' : '');
+      } else {
+        node = createEntryCard(entry.label, entry.data, entry.metaFilename, entry.isBest);
+        node.dataset.key = entry.key;
+      }
+      used.add(entry.key);
+      const wantedNext = prevNode ? prevNode.nextSibling : container.firstChild;
+      if (wantedNext !== node) container.insertBefore(node, wantedNext);
+      prevNode = node;
+    }
+    for (const [key, node] of existing) {
+      if (!used.has(key)) node.remove();
+    }
+  }
+
+  // Replace container's contents with `desired` cards (reconciled) or an
+  // empty-state message if there's nothing to show.
+  function renderCardList(container, desired, emptyMessage) {
+    if (desired.length === 0) {
+      container.innerHTML = '<div class="empty">' + emptyMessage + '</div>';
+      return;
+    }
+    for (const child of Array.from(container.children)) {
+      if (!child.dataset || !child.dataset.key) child.remove();
+    }
+    reconcileCards(container, desired);
+  }
+
   async function refresh() {
     const best = await fetchBest();
     if (!best) return;
     const tentLog = document.getElementById('log-tent');
     const manLog = document.getElementById('log-mannequin');
-    tentLog.innerHTML = '';
-    manLog.innerHTML = '';
 
     const tentList = best.tent || [];
     const manList = best.mannequin || [];
@@ -541,7 +532,8 @@ async function fetchBest() {
 
     function appendFiltered(list, container, labelName, currentBestMeta) {
       const filtered = list.filter(e => (e.pushed === true) || (e.model_source === 'gd_backup'));
-      let renderedCount = 0;
+      const desired = [];
+      let pinnedResult = null;
 
       // Find the exact meta that's being sent (if present in the full list)
       let bestInList = null;
@@ -549,58 +541,51 @@ async function fetchBest() {
         bestInList = list.find(e => (e._meta_filename || null) === currentBestMeta) || null;
       }
 
-        // If a cloud-pulled best exists for this label, render it first (it overrides GD backup)
-        let cloudBest = null;
-        if (labelName === 'tent' && cloudTent) cloudBest = cloudTent;
-        if (labelName === 'mannequin' && cloudMan) cloudBest = cloudMan;
+      // If a cloud-pulled best exists for this label, render it first (it overrides GD backup)
+      let cloudBest = null;
+      if (labelName === 'tent' && cloudTent) cloudBest = cloudTent;
+      if (labelName === 'mannequin' && cloudMan) cloudBest = cloudMan;
 
-        // If the cloud in-memory best corresponds to an exported meta that we're
-        // also about to render, prefer the exported meta and skip the cloud-only
-        // card to avoid showing two highlighted entries. If a cloud best exists
-        // but has no matching exported meta, render the cloud card (highlighted).
-        if (cloudBest) {
-          if (currentBestMeta && cloudBest._meta_filename && cloudBest._meta_filename === currentBestMeta) {
-            // Exported meta will be rendered below as the pinned best; skip cloud-only card
-            cloudBest = null;
-          }
+      // If the cloud in-memory best corresponds to an exported meta that we're
+      // also about to render, prefer the exported meta and skip the cloud-only
+      // card to avoid showing two highlighted entries. If a cloud best exists
+      // but has no matching exported meta, render the cloud card (highlighted).
+      if (cloudBest) {
+        if (currentBestMeta && cloudBest._meta_filename && cloudBest._meta_filename === currentBestMeta) {
+          // Exported meta will be rendered below as the pinned best; skip cloud-only card
+          cloudBest = null;
         }
-        if (cloudBest) {
-          const cloudData = {
-            timestamp: Date.now(),
-            assignment_id: (cloudBest.assignment && cloudBest.assignment.id) || null,
-            assignment: cloudBest.assignment || null,
-            score: cloudBest.score || null,
-            model_source: cloudBest.model_source || 'cloud',
-            gemini_reason: cloudBest.gemini_reason || null,
-            bbox: cloudBest.bbox || null,
-            full_image: null,
-            // server may include inline base64 to avoid separate /export fetch
-            full_image_b64: cloudBest.full_image_b64 || null,
-            roi_image_b64: cloudBest.roi_image_b64 || null,
-            since_session_start_ms: cloudBest.since_session_start_ms,
-            _is_cloud_pull: true,
-          };
-          const cloudCard = createEntryCard(labelName + ' (cloud)', cloudData, cloudBest._meta_filename || null, true);
-          container.appendChild(cloudCard);
-          renderedCount++;
-          // Cloud best overrides GD backup pinned entry — don't render the exported pinned entry as well
-          bestInList = null;
-        }
-
-      if (filtered.length === 0 && !bestInList) {
-        if (renderedCount === 0) {
-          container.innerHTML = '<div class="empty">No ' + labelName + ' images to show</div>';
-        }
-        updateCount(labelName, renderedCount);
-        return;
+      }
+      if (cloudBest) {
+        const cloudData = {
+          timestamp: Date.now(),
+          assignment_id: (cloudBest.assignment && cloudBest.assignment.id) || null,
+          assignment: cloudBest.assignment || null,
+          score: cloudBest.score || null,
+          model_source: cloudBest.model_source || 'cloud',
+          gemini_reason: cloudBest.gemini_reason || null,
+          bbox: cloudBest.bbox || null,
+          full_image: null,
+          // server may include inline base64 to avoid separate /export fetch
+          full_image_b64: cloudBest.full_image_b64 || null,
+          roi_image_b64: cloudBest.roi_image_b64 || null,
+          since_session_start_ms: cloudBest.since_session_start_ms,
+          _is_cloud_pull: true,
+        };
+        const metaFilename = cloudBest._meta_filename || null;
+        desired.push({ key: cardKey(labelName, metaFilename, cloudData), label: labelName + ' (cloud)', data: cloudData, metaFilename, isBest: true });
+        pinnedResult = { data: cloudData, metaFilename };
+        // Cloud best overrides GD backup pinned entry — don't render the exported pinned entry as well
+        bestInList = null;
       }
 
       // If we have a best meta, render it first (pinned to top) and remove it from the remainder
       if (bestInList) {
         const idx = filtered.findIndex(e => (e._meta_filename || null) === currentBestMeta);
         if (idx >= 0) filtered.splice(idx, 1);
-        container.appendChild(createEntryCard(labelName, bestInList, bestInList._meta_filename || null, true));
-        renderedCount++;
+        const metaFilename = bestInList._meta_filename || null;
+        desired.push({ key: cardKey(labelName, metaFilename, bestInList), label: labelName, data: bestInList, metaFilename, isBest: true });
+        pinnedResult = { data: bestInList, metaFilename };
       }
 
       // Render the remainder (non-highlighted)
@@ -609,124 +594,31 @@ async function fetchBest() {
         if (cloudBest && cloudBest._meta_filename && e._meta_filename && cloudBest._meta_filename === e._meta_filename) {
           continue;
         }
-        container.appendChild(createEntryCard(labelName, e, e._meta_filename || null, false));
-        renderedCount++;
+        const metaFilename = e._meta_filename || null;
+        desired.push({ key: cardKey(labelName, metaFilename, e), label: labelName, data: e, metaFilename, isBest: false });
       }
-      updateCount(labelName, renderedCount);
+
+      renderCardList(container, desired, 'No ' + labelName + ' images to show');
+      updateCount(labelName, desired.length);
+      return pinnedResult;
     }
 
-    appendFiltered(tentList, tentLog, 'tent', currentBestTent);
-    appendFiltered(manList, manLog, 'mannequin', currentBestMan);
+    const bestTentInfo = appendFiltered(tentList, tentLog, 'tent', currentBestTent);
+    const bestManInfo = appendFiltered(manList, manLog, 'mannequin', currentBestMan);
 
-    // Render the most recent raw image pulled from the imaging GS (served under best.gs)
-    const gsPanel = document.getElementById('gs-panel');
-    gsPanel.innerHTML = '';
-    try {
-      const gsList = best.gs || [];
-      updateCount('gs', gsList.length);
-      if (gsList.length === 0) {
-        gsPanel.innerHTML = '<div class="empty">No recent ground-station pulls</div>';
-      } else {
-        const latest = gsList[0];
-        // Build a minimal GS card: image + assignment only
-        const card = document.createElement('div');
-        card.className = 'gs-card';
-        const tsDiv = document.createElement('div');
-        tsDiv.className = 'timestamp';
-        tsDiv.textContent = fmtTs(latest.timestamp);
-        card.appendChild(tsDiv);
-
-        const img = new Image();
-        const canvas = document.createElement('canvas');
-        canvas.className = 'entry-canvas';
-        canvas.width = 320; canvas.height = 180;
-        card.appendChild(canvas);
-        img.onload = () => {
-          const ctx = canvas.getContext('2d');
-          const ratio = img.naturalWidth / img.naturalHeight;
-          const w = Math.min(320, img.naturalWidth);
-          const h = Math.round(w / ratio);
-          canvas.width = w; canvas.height = h;
-          ctx.drawImage(img, 0, 0, w, h);
-          drawGsGridOverlay(ctx, w, h, latest.assignment || null);
-        };
-        img.onerror = () => {
-          const ctx = canvas.getContext('2d');
-          ctx.fillStyle = '#1a212b'; ctx.fillRect(0,0,canvas.width,canvas.height);
-        };
-        img.src = `${API_BASE}/export/` + (latest.full_image || '');
-
-        // Grid legend (key)
-        const legendDiv = document.createElement('div');
-        legendDiv.className = 'gs-legend';
-        legendDiv.innerHTML =
-          '<div class="legend-title">Key</div>' +
-          '<div class="legend-row">' +
-            '<div><span class="legend-swatch" style="border-color:rgba(0,180,255,0.85)"></span>Every ' + GS_GRID_SPACING_METERS + ' m on ground</div>' +
-            '<div><span class="legend-swatch" style="border-color:rgba(255,215,0,0.95)"></span>Image center crosshair</div>' +
-          '</div>';
-        card.appendChild(legendDiv);
-
-        // Location block (lat/lon)
-        try {
-          const telemetry = getAssignmentImageTelemetry(latest.assignment || null);
-          const lat = telemetry ? telemetry.lat : null;
-          const lon = telemetry ? telemetry.lon : null;
-          const altitude = telemetry ? telemetry.altitude : null;
-
-          const locDiv = document.createElement('div');
-          locDiv.className = 'gs-loc';
-          locDiv.innerHTML = '<div class="label-sm">Location</div>' +
-                             '<div class="hero-row">' +
-                               '<div>' +
-                                 '<div class="hero-key">LAT</div>' +
-                                 '<div class="hero-val">' + (lat !== null ? lat.toFixed(6) : 'N/A') + '</div>' +
-                               '</div>' +
-                               '<div>' +
-                                 '<div class="hero-key">LON</div>' +
-                                 '<div class="hero-val">' + (lon !== null ? lon.toFixed(6) : 'N/A') + '</div>' +
-                               '</div>' +
-                             '</div>' +
-                             '<div class="alt-row">Alt: ' + (altitude !== null ? altitude.toFixed(1) + ' m' : 'N/A') + '</div>';
-          card.appendChild(locDiv);
-        } catch (e) { console.error('Error rendering location:', e); }
-
-        // Assignment block (minimal)
-        const assignDiv = document.createElement('div');
-        assignDiv.className = 'assignment';
-        assignDiv.innerHTML = '<details><summary>Raw assignment</summary><pre>' + JSON.stringify(latest.assignment || {}, null, 2) + '</pre></details>';
-        card.appendChild(assignDiv);
-
-        gsPanel.appendChild(card);
-      }
-    } catch (e) {
-      gsPanel.innerHTML = '<div class="empty">Error loading GS image</div>';
+    // Best column: exactly the two current-best cards (tent + mannequin), each
+    // with its own "Send to Autopilot" button. Autopilot sends are manual only.
+    const bestPanel = document.getElementById('best-panel');
+    const bestDesired = [];
+    if (bestTentInfo) {
+      bestDesired.push({ key: cardKey('tent', bestTentInfo.metaFilename, bestTentInfo.data), label: 'tent', data: bestTentInfo.data, metaFilename: bestTentInfo.metaFilename, isBest: true });
     }
+    if (bestManInfo) {
+      bestDesired.push({ key: cardKey('mannequin', bestManInfo.metaFilename, bestManInfo.data), label: 'mannequin', data: bestManInfo.data, metaFilename: bestManInfo.metaFilename, isBest: true });
+    }
+    renderCardList(bestPanel, bestDesired, 'No best images yet');
+    updateCount('best', bestDesired.length);
   }
-
-  // Grid spacing control
-  try {
-    const gsSpacingSelect = document.getElementById('gs-grid-spacing');
-    const gsShowCrosshair = document.getElementById('gs-show-crosshair');
-    if (gsSpacingSelect) {
-      const initial = Number(gsSpacingSelect.value);
-      if (Number.isFinite(initial) && initial > 0) GS_GRID_SPACING_METERS = initial;
-      gsSpacingSelect.addEventListener('change', () => {
-        const v = Number(gsSpacingSelect.value);
-        if (Number.isFinite(v) && v > 0) {
-          GS_GRID_SPACING_METERS = v;
-          refresh();
-        }
-      });
-    }
-    if (gsShowCrosshair) {
-      GS_SHOW_CROSSHAIR = !!gsShowCrosshair.checked;
-      gsShowCrosshair.addEventListener('change', () => {
-        GS_SHOW_CROSSHAIR = !!gsShowCrosshair.checked;
-        refresh();
-      });
-    }
-  } catch (e) { console.warn('Grid spacing control unavailable', e); }
 
   // Admin actions: clear cloud server / delete local saved images
   async function runAdminCommand(command, confirmMessage, button, { refreshOnSuccess = true } = {}) {

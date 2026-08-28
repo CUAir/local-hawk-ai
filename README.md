@@ -70,7 +70,7 @@ The local worker (`core.py`) accepts the following command-line arguments:
   - Default: `8081`
 
 - `--interval-seconds <float>`
-  - Scheduler interval (seconds) between cloud polls and autopilot sends.
+  - Scheduler interval (seconds) between cloud polls. Autopilot sends are manual — triggered only by pressing "Send to Autopilot" on a dashboard card.
   - Default: `20.0`
 
 - `--autopilot-ip <host:port>`

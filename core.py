@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from http.server import ThreadingHTTPServer
-from communication.intsys_gs_api import MapCommandHandler, FrontendHandler, ResultStore, EXPORT_DIR, notify_sse
+from communication.intsys_gs_api import MapCommandHandler, FrontendHandler, ResultStore, EXPORT_DIR, notify_sse, _parse_label
 import requests
 import io
 import base64
@@ -291,29 +291,17 @@ class VisionClient:
             while remaining > 0:
                 # Log every 5 seconds, then every second in the last 5 seconds.
                 if remaining <= 5 or remaining % 5 == 0:
-                    print_yellow(f"[scheduler] Next cloud poll / autopilot send in {remaining}s")
+                    print_yellow(f"[scheduler] Next cloud poll in {remaining}s")
                 time.sleep(1)
                 remaining -= 1
 
-            # First: poll cloud once for new best images. Do not hold the send lock
-            # while polling (poll may perform I/O and filesystem writes).
+            # Poll cloud once for new best images. Autopilot sends are no longer
+            # automatic here — they only happen when a user presses "Send to
+            # Autopilot" on a dashboard card (see send_meta_to_autopilot()).
             try:
                 self._poll_cloud_once()
             except Exception as e:
                 print_yellow(f"[scheduler] Cloud poll failed: {e}")
-
-            # Then: attempt to send results to autopilot (non-blocking acquire)
-            if not self._send_lock.acquire(blocking=False):
-                print_yellow("[scheduler] send_to_autopilot() already running; skipping this tick")
-                continue
-            try:
-                print_green("\n[scheduler] Sending current results to autopilot")
-                try:
-                    self.send_to_autopilot()
-                except Exception as e:
-                    print_red(f"[scheduler] send_to_autopilot() failed: {e}")
-            finally:
-                self._send_lock.release()
 
             # loop repeats after interval
 
@@ -388,83 +376,143 @@ class VisionClient:
         cand = CandidateImage(bbox=bbox, score=score, source=base_src, label=LabelTypes.UNKNOWN)
         return cand
 
-    def send_to_autopilot(self):
-        """Select best entries and POST payloads to the configured autopilot endpoint."""
+    def send_entry_to_autopilot(self, entry, target_type_str: str) -> dict:
+        """Build a candidate from `entry`, project it, and POST it to the autopilot endpoint.
+
+        `entry` is (assignment, roi, classification, model_source, gemini_reason, meta_filename).
+        Returns {"status": "success"|"error", "message": str} for callers (e.g. the manual
+        "Send to Autopilot" button) that need to relay the outcome back to a user.
+        """
         if not self.autopilot_url:
-            print_yellow("[autopilot] Autopilot URL not configured; skipping send")
-            return
+            msg = "Autopilot URL not configured; skipping send"
+            print_yellow(f"[autopilot] {msg}")
+            return {"status": "error", "message": msg}
 
-        def _process_entry(entry, target_type_str):
-            if entry is None:
-                print_yellow(f"[autopilot] No {target_type_str} entry to send")
-                return
+        if entry is None:
+            msg = f"No {target_type_str} entry to send"
+            print_yellow(f"[autopilot] {msg}")
+            return {"status": "error", "message": msg}
+
+        try:
+            assignment = entry[0]
+            roi = entry[1]
+            classification = entry[2]
+            meta_fn = entry[5] if len(entry) > 5 else None
+
+            cand = None
             try:
-                assignment = entry[0]
-                roi = entry[1]
-                classification = entry[2]
-                meta_fn = entry[5] if len(entry) > 5 else None
-
-                cand = None
-                try:
-                    cand = self._build_candidate_from_entry(assignment, roi, classification, meta_filename=meta_fn)
-                except Exception as e:
-                    print_red(f"[autopilot] Failed to build candidate for projection: {e}")
-                    cand = None
-
-                lat = None; lon = None
-                if cand is not None:
-                    try:
-                        proj = self._projector.project(cand)
-                        if proj:
-                            lat = proj.lat
-                            lon = proj.lon
-                    except Exception as e:
-                        print_red(f"[autopilot] Projection error: {e}")
-
-                if lat is None or lon is None:
-                    print_red(f"[autopilot] Could not determine lat/lon for {target_type_str}; skipping send")
-                    return
-
-                payload = {
-                    "lat": float(lat),
-                    "lng": float(lon),
-                    "target_type": target_type_str,
-                    "id": int(self._autopilot_id),
-                }
-                print("PAYLOAD:", payload)
-                try:
-                    # Use WorkClient's retry helper for autopilot POSTs to benefit from same retry/backoff logic
-                    resp = None
-                    try:
-                        resp = self.work_client._do_request_with_retries('post', self.autopilot_url, json=payload, timeout=5)
-                    except Exception as e:
-                        print_red(f"[autopilot] Failed to POST to autopilot after retries: {e}")
-                        resp = None
-
-                    if resp is not None:
-                        if 200 <= resp.status_code < 300:
-                            print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
-                            self._autopilot_id += 1
-                        else:
-                            print_red(f"[autopilot] Autopilot rejected payload (status={resp.status_code})")
-                except Exception as e:
-                    print_red(f"[autopilot] Unexpected error posting to autopilot: {e}")
+                cand = self._build_candidate_from_entry(assignment, roi, classification, meta_filename=meta_fn)
             except Exception as e:
-                print_red(f"[autopilot] Unexpected error processing entry: {e}")
+                print_red(f"[autopilot] Failed to build candidate for projection: {e}")
+                cand = None
 
-        try:
-            m_entry = self.result_store.get_mannequin() if self.result_store else None
-            if m_entry:
-                _process_entry(m_entry, "person")
-        except Exception:
-            pass
+            lat = None; lon = None
+            if cand is not None:
+                try:
+                    proj = self._projector.project(cand)
+                    if proj:
+                        lat = proj.lat
+                        lon = proj.lon
+                except Exception as e:
+                    print_red(f"[autopilot] Projection error: {e}")
 
-        try:
-            t_entry = self.result_store.get_tent() if self.result_store else None
-            if t_entry:
-                _process_entry(t_entry, "tent")
-        except Exception:
-            pass
+            if lat is None or lon is None:
+                msg = f"Could not determine lat/lon for {target_type_str}; skipping send"
+                print_red(f"[autopilot] {msg}")
+                return {"status": "error", "message": msg}
+
+            payload = {
+                "lat": float(lat),
+                "lng": float(lon),
+                "target_type": target_type_str,
+                "id": int(self._autopilot_id),
+            }
+            print("PAYLOAD:", payload)
+            try:
+                # Use WorkClient's retry helper for autopilot POSTs to benefit from same retry/backoff logic
+                resp = self.work_client._do_request_with_retries('post', self.autopilot_url, json=payload, timeout=5)
+            except Exception as e:
+                msg = f"Failed to POST to autopilot after retries: {e}"
+                print_red(f"[autopilot] {msg}")
+                return {"status": "error", "message": msg}
+
+            if resp is not None and 200 <= resp.status_code < 300:
+                print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
+                self._autopilot_id += 1
+                return {"status": "success", "message": f"Sent {target_type_str} to autopilot (lat={lat:.6f}, lon={lon:.6f})"}
+            else:
+                status = resp.status_code if resp is not None else "no response"
+                msg = f"Autopilot rejected payload (status={status})"
+                print_red(f"[autopilot] {msg}")
+                return {"status": "error", "message": msg}
+        except Exception as e:
+            msg = f"Unexpected error processing entry: {e}"
+            print_red(f"[autopilot] {msg}")
+            return {"status": "error", "message": msg}
+
+    def send_meta_to_autopilot(self, meta_filename: str) -> dict:
+        """Send one specific exported detection (by meta filename) to autopilot.
+
+        This is the entry point for the dashboard's manual "Send to Autopilot"
+        button, since autopilot sends are no longer automatic. Rebuilds the
+        ROI/Classification from the meta JSON + its full image on disk, the
+        same way ResultStore.rebuild_from_disk() does when restoring state.
+        """
+        safe_name = Path(meta_filename or "").name
+        if not safe_name.startswith("meta_") or not safe_name.endswith(".json"):
+            return {"status": "error", "message": "Invalid meta_filename"}
+
+        meta_path = EXPORT_DIR / safe_name
+        if not meta_path.exists():
+            return {"status": "error", "message": f"Meta file not found: {safe_name}"}
+
+        with self._send_lock:
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+
+                label = _parse_label(meta.get("label"))
+                if label == LabelType.TENT:
+                    target_type_str = "tent"
+                elif label == LabelType.MANNEQUIN:
+                    target_type_str = "person"
+                else:
+                    return {"status": "error", "message": f"Unknown label in meta file: {meta.get('label')}"}
+
+                bbox = meta.get("bbox") or []
+                full_image_name = meta.get("full_image")
+                if len(bbox) != 4 or not full_image_name:
+                    return {"status": "error", "message": "Meta file missing bbox or full_image"}
+
+                full_path = EXPORT_DIR / full_image_name
+                if not full_path.exists():
+                    return {"status": "error", "message": f"Full image not found: {full_image_name}"}
+
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                full_image = Image.open(full_path).convert("RGB")
+                width, height = full_image.size
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+                if x2 <= x1 or y2 <= y1:
+                    return {"status": "error", "message": "Degenerate bbox in meta file"}
+
+                roi = ROI(roi=full_image.crop((x1, y1, x2, y2)), top_left=(x1, y1), bottom_right=(x2, y2))
+                classification = Classification(label=label, number_conf=float(meta.get("score", 0.0)))
+                entry = (
+                    meta.get("assignment"),
+                    roi,
+                    classification,
+                    meta.get("model_source", ""),
+                    meta.get("gemini_reason"),
+                    safe_name,
+                )
+                return self.send_entry_to_autopilot(entry, target_type_str)
+            except Exception as e:
+                msg = f"Failed to send meta file to autopilot: {e}"
+                print_red(f"[autopilot] {msg}")
+                return {"status": "error", "message": msg}
 
     def _poll_cloud_once(self):
         """Perform a single poll of the cloud for mannequin and tent best images.
@@ -996,12 +1044,14 @@ def start_frontend_server(port: int, server_port: int):
 def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
     header("\n[worker] Starting worker loop")
     worker = VisionClient(work_client, mapper, result_store, autopilot_host, result_interval_seconds)
+    MapCommandHandler.vision_client = worker
     while True:
         try:
             worker.run_task()
         except Exception as e:
             print_red(f"[worker] Unhandled worker error: {e}")
             print("[worker] MOST LIKELY BECAUSE gs-backend isn't running or isn't connected")
+            time.sleep(2)
 
 
 def idle_mapping_monitor_loop(mapper: Mapper, timeout_seconds: float):
