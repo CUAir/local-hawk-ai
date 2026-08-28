@@ -25,6 +25,8 @@ class WorkClient(object):
         self.upload_img_endp = "api/images"
         self.tent_img_endp = "api/images/tent"
         self.mannequin_img_endp = "api/images/mannequin"
+        self.mapping_status_endp = "api/mapping/status"
+        self.mapping_result_endp = "api/mapping/result"
 
         # Specify our username to interact w/ gs
         self.client_header = {"id": 1, "username": "adlc",
@@ -276,6 +278,80 @@ class WorkClient(object):
             print_red(f"[work_client] Cloud clear failed (status={response.status_code})")
 
         return response
+
+    def get_cloud_mapping_status(self) -> typing.Optional[dict]:
+        """GET /api/mapping/status on the cloud server.
+
+        Returns the decoded {running, last_result, images_queued} dict, or None
+        if the cloud is unreachable or answered with something unusable. The
+        caller polls this on a timer, so a failure here is not worth raising —
+        it just means "try again next tick".
+        """
+        url = self.cs_url + self.mapping_status_endp
+        try:
+            response = self._do_request_with_retries(
+                'get', url, timeout=self.http_timeout_seconds,
+            )
+        except Exception as e:
+            logger.debug("Cloud mapping status unreachable — url=%s err=%s", url, e)
+            return None
+
+        if response.status_code != 200:
+            logger.debug("Cloud mapping status returned %s", response.status_code)
+            return None
+
+        try:
+            return response.json()
+        except Exception:
+            print_yellow("[work_client] Cloud mapping status returned non-JSON body")
+            return None
+
+    def download_cloud_mapping_result(self, dest_path) -> bool:
+        """GET /api/mapping/result and stream it to dest_path.
+
+        Writes to a temporary sibling file first and renames on success, so a
+        truncated download never leaves a half-written map sitting in the
+        outputs directory looking complete. Returns True on success.
+        """
+        from pathlib import Path
+
+        dest_path = Path(dest_path)
+        url = self.cs_url + self.mapping_result_endp
+        tmp_path = dest_path.with_name(dest_path.name + ".part")
+
+        try:
+            response = self._do_request_with_retries(
+                'get', url, timeout=(self.http_timeout_seconds, 120), stream=True,
+            )
+        except Exception as e:
+            print_red(f"[work_client] Cloud map download failed: {e}")
+            return False
+
+        if response.status_code != 200:
+            print_yellow(
+                f"[work_client] Cloud map not available for download (status={response.status_code})"
+            )
+            return False
+
+        try:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1 << 16):
+                    if chunk:
+                        f.write(chunk)
+            tmp_path.replace(dest_path)
+        except Exception as e:
+            print_red(f"[work_client] Failed writing cloud map to {dest_path}: {e}")
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+            return False
+
+        size_kb = dest_path.stat().st_size / 1024
+        logger.info("Downloaded cloud map — dest=%s size_kb=%.1f", dest_path, size_kb)
+        print_green(f"[work_client] Cloud map saved → {dest_path} ({size_kb:.1f} KB)")
+        return True
 
     def check_cloud_saved(self) -> dict:
         """Check whether the cloud server currently has a saved best image for
