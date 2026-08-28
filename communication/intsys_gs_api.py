@@ -1,11 +1,13 @@
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, parse_qs
 import json as _json
 import json
 import os
 import io
 import base64
+import hashlib
 import threading
+import requests
 from utils.helper import print_green, print_red, print_yellow
 from constructs.roi import ROI
 from constructs.classification import Classification, LabelType
@@ -47,6 +49,158 @@ def ensure_export_dir() -> bool:
 # Simple Server-Sent Events (SSE) support for notifying frontend of new GS pulls
 SSE_CLIENTS = []
 SSE_LOCK = threading.Lock()
+
+# --- Continuous-capture control (proxied to MPS on the aircraft) -------------
+# Serializes capture commands so two dashboards can't both pass the "is it
+# idle?" check and issue two starts.
+CAPTURE_CMD_LOCK = threading.Lock()
+# (connect, read). Status is probed often, so it must fail fast.
+CAPTURE_STATUS_TIMEOUT = (1.0, 1.5)
+CAPTURE_CMD_TIMEOUT = (1.0, 5.0)
+# MPS's own default (mini-plane-system/server/server.py start_cc).
+DEFAULT_CAPTURE_INTERVAL = 2.0
+# Bounds for an operator-supplied interval. Below ~0.5s the GoPro cannot keep up
+# with the shutter; above 60s is almost certainly a typo rather than an intent.
+MIN_CAPTURE_INTERVAL = 0.5
+MAX_CAPTURE_INTERVAL = 60.0
+
+# --- Log tailing -------------------------------------------------------------
+LOG_READ_SEMAPHORE = threading.Semaphore(4)
+# Bounds concurrent proxy reads toward the aircraft; that link also carries
+# image uploads, so it must never see a pile of in-flight log requests.
+LOG_PROXY_SEMAPHORE = threading.Semaphore(2)
+LOG_PROXY_TIMEOUT = (2.0, 5.0)
+# Circuit breaker: after this many consecutive failures, stop dialling the
+# aircraft for a while and answer from the cached failure instead.
+LOG_PROXY_FAIL_THRESHOLD = 3
+LOG_PROXY_COOLDOWN_S = 30.0
+_LOG_PROXY_STATE = {"fails": 0, "open_until": 0.0}
+_LOG_PROXY_LOCK = threading.Lock()
+LOG_MAX_BYTES_DEFAULT = 65536
+LOG_MAX_BYTES_MIN = 4096
+LOG_MAX_BYTES_MAX = 262144
+LOG_GEN_HEAD_BYTES = 256
+
+
+def _log_gen_token(path: Path, st) -> str:
+    """Identity token for a log file's current incarnation.
+
+    Device/inode plus a hash of the file's FIRST COMPLETE LINE. Two properties
+    are required and both are easy to get wrong:
+
+    - Stable across appends. Hashing a fixed-size head fails here: for a file
+      shorter than the head size, appending changes the bytes read and so
+      changes the token, making every poll look like a restart.
+    - Different across incarnations. Inode alone fails here: MPS truncates its
+      log in place via open(path, "w") at camera.py:53, leaving the inode
+      unchanged. The first line carries a fresh timestamp after a restart, so
+      hashing it catches exactly that case.
+
+    Before the first newline exists the token is dev:ino only; the offset > size
+    check still catches a reset in that window.
+    """
+    head = b""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(LOG_GEN_HEAD_BYTES)
+        nl = chunk.find(b"\n")
+        head = chunk[:nl] if nl != -1 else b""
+    except Exception:
+        pass
+    seed = f"{getattr(st, 'st_dev', 0)}:{getattr(st, 'st_ino', 0)}:".encode()
+    return hashlib.sha1(seed + head).hexdigest()[:16]
+
+
+def read_log_chunk(path: Path, offset: int = 0, gen: str = "", max_bytes: int = LOG_MAX_BYTES_DEFAULT) -> dict:
+    """Read new bytes from a log file, returning whole lines only.
+
+    Byte-offset incremental tail. Returns a dict shaped for the /api/logs
+    response. Never raises: failures come back as {"ok": False, "reason": ...}
+    so the frontend has a single code path.
+    """
+    max_bytes = max(LOG_MAX_BYTES_MIN, min(int(max_bytes or LOG_MAX_BYTES_DEFAULT), LOG_MAX_BYTES_MAX))
+    try:
+        if path is None or not Path(path).is_file():
+            return {"ok": False, "reason": "missing", "detail": str(path)}
+        path = Path(path)
+        st = path.stat()
+    except PermissionError as e:
+        return {"ok": False, "reason": "permission", "detail": str(e)}
+    except Exception as e:
+        return {"ok": False, "reason": "error", "detail": str(e)}
+
+    size = st.st_size
+    cur_gen = _log_gen_token(path, st)
+
+    # The caller's offset is usable only if it came with a matching gen and
+    # points inside the file. A gen mismatch means the file was restarted
+    # (truncated in place, rotated, or replaced); an offset past EOF means the
+    # same. Either way we resync to the tail rather than emit garbage.
+    usable = (
+        bool(gen)
+        and gen == cur_gen
+        and offset is not None
+        and 0 <= offset <= size
+    )
+
+    dropped = 0
+    if usable:
+        resync = False
+        start = offset
+        if size - start > max_bytes:
+            dropped = (size - start) - max_bytes
+            start = size - max_bytes
+    else:
+        resync = True
+        start = max(0, size - max_bytes)
+        # Report the skipped span even on a first read (offset 0): opening a
+        # months-old server.log should say so rather than silently show a tail.
+        dropped = max(0, start - (offset or 0))
+
+    try:
+        with LOG_READ_SEMAPHORE:
+            with open(path, "rb") as f:
+                f.seek(start)
+                raw = f.read(max_bytes)
+    except PermissionError as e:
+        return {"ok": False, "reason": "permission", "detail": str(e)}
+    except Exception as e:
+        return {"ok": False, "reason": "error", "detail": str(e)}
+
+    new_offset = start + len(raw)
+
+    # Any time we seeked rather than continued, `start` almost certainly landed
+    # mid-line. Drop that leading fragment so the first rendered line is real.
+    if start > 0 and (resync or dropped):
+        nl = raw.find(b"\n")
+        raw = raw[nl + 1:] if nl != -1 else b""
+
+    # We're racing a live writer: a trailing partial line must be withheld and
+    # re-read next poll, or lines get split across responses.
+    if raw and not raw.endswith(b"\n"):
+        nl = raw.rfind(b"\n")
+        if nl == -1:
+            new_offset -= len(raw)
+            raw = b""
+        else:
+            new_offset -= (len(raw) - nl - 1)
+            raw = raw[:nl + 1]
+
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    return {
+        "ok": True,
+        "gen": cur_gen,
+        "offset": new_offset,
+        "size": size,
+        "reset": resync,
+        "dropped_bytes": dropped,
+        "lines": lines,
+        "mtime": st.st_mtime,
+    }
 
 def notify_sse(event: str, data: dict):
     """Send an SSE event to all connected clients. Removes dead clients."""
@@ -277,6 +431,12 @@ def _parse_result_payload(data: dict):
 class MapCommandHandler(BaseHTTPRequestHandler):
     mapper = None
     result_store: ResultStore = None
+    # e.g. "http://192.168.1.10:8000". None => capture controls disabled and no
+    # socket is ever opened toward the aircraft.
+    mps_base_url = None
+    # id -> {"label": str, "kind": "file"|"proxy", "path": Path|None}
+    # An allowlist. The client sends a key, never a path.
+    log_sources: dict = {}
 
     def end_headers(self):
         # Allow browser frontends on different origins to call this API.
@@ -597,6 +757,94 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 self.wfile.write(_json.dumps(resp).encode())
                 return
 
+            # Capture control status. Proxied to MPS, on its own endpoint so an
+            # unreachable aircraft can never slow down /api/best.
+            if path == '/api/capture/status':
+                now_ms = int(time.time() * 1000)
+                if self._mps_url('/pipeline/status') is None:
+                    # Not configured: return without opening a socket.
+                    self._json_response(200, {"configured": False, "checked_at": now_ms})
+                    return
+                ok, payload = self._mps_status()
+                if ok:
+                    self._json_response(200, {
+                        "configured": True,
+                        "reachable": True,
+                        "mode": payload.get('mode'),
+                        "pipeline_running": bool(payload.get('pipeline_running')),
+                        "checked_at": now_ms,
+                    })
+                else:
+                    self._json_response(200, {
+                        "configured": True,
+                        "reachable": False,
+                        "error": str(payload),
+                        "checked_at": now_ms,
+                    })
+                return
+
+            # Available log sources. Drives the frontend tab strip, so adding a
+            # source later needs no frontend change.
+            if path == '/api/logs/sources':
+                out = []
+                for sid, entry in (self.log_sources or {}).items():
+                    available, detail = True, None
+                    if entry.get('kind') == 'file':
+                        p = entry.get('path')
+                        try:
+                            available = p is not None and Path(p).is_file()
+                        except Exception:
+                            available = False
+                        if not available:
+                            detail = "log file not found (service may not have started yet)"
+                    out.append({
+                        "id": sid,
+                        "label": entry.get('label', sid),
+                        "kind": entry.get('kind', 'file'),
+                        "available": available,
+                        "detail": detail,
+                    })
+                self._json_response(200, {"sources": out})
+                return
+
+            # Incremental log tail. Query is parsed from the raw self.path:
+            # line ~295 unquotes before splitting, which would misparse a %3F
+            # inside a value, and we must not change that shared line.
+            if path == '/api/logs':
+                q = parse_qs(urlsplit(self.path).query)
+                source_id = (q.get('source') or [''])[0]
+                entry, err = self._resolve_log_source(source_id)
+                if err is not None:
+                    self._json_response(400, err)
+                    return
+                try:
+                    offset = int((q.get('offset') or ['0'])[0])
+                except ValueError:
+                    offset = 0
+                gen = (q.get('gen') or [''])[0]
+                try:
+                    max_bytes = int((q.get('max_bytes') or [str(LOG_MAX_BYTES_DEFAULT)])[0])
+                except ValueError:
+                    max_bytes = LOG_MAX_BYTES_DEFAULT
+
+                if entry.get('kind') == 'file':
+                    resolved = entry.get('path')
+                    # Re-check containment at read time: the path was resolved
+                    # once at startup, and a symlink could have been swapped in
+                    # since to point somewhere else entirely.
+                    try:
+                        if resolved is None or Path(resolved).resolve() != Path(entry['path']).resolve():
+                            result = {"ok": False, "reason": "error", "detail": "log path changed since startup"}
+                        else:
+                            result = read_log_chunk(Path(resolved), offset, gen, max_bytes)
+                    except Exception as e:
+                        result = {"ok": False, "reason": "error", "detail": str(e)}
+                else:
+                    result = self._proxy_log_chunk(offset, gen, max_bytes)
+                result['source'] = source_id
+                self._json_response(200, result)
+                return
+
             # Default: mapping status (backwards compatibility)
             response = {
                 "mapping_running": self.mapper.mapping_running,
@@ -623,6 +871,207 @@ class MapCommandHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'application/json')
         self.end_headers()
         self.wfile.write(encoded)
+
+    # --- MPS capture control helpers ---------------------------------------
+
+    def _mps_url(self, path: str):
+        """Absolute MPS URL for `path`, or None when capture control is off."""
+        base = (self.mps_base_url or "").strip()
+        if not base:
+            return None
+        if not base.startswith(("http://", "https://")):
+            base = "http://" + base
+        return base.rstrip('/') + path
+
+    def _mps_status(self):
+        """Read MPS pipeline status. Returns (ok, payload_or_error). Never raises.
+
+        Deliberately does NOT use WorkClient._do_request_with_retries: that
+        retries, and a retried start whose response was merely lost would issue
+        a second start. Capture traffic is zero-retry throughout.
+        """
+        url = self._mps_url('/pipeline/status')
+        if url is None:
+            return False, "not configured"
+        try:
+            resp = requests.get(url, timeout=CAPTURE_STATUS_TIMEOUT)
+        except Exception as e:
+            return False, f"{type(e).__name__}"
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code}"
+        try:
+            return True, resp.json()
+        except Exception:
+            return False, "malformed status response"
+
+    def _capture_command(self, action: str, interval=None):
+        """Run capture_start / capture_stop against MPS. Returns a response dict."""
+        if self._mps_url('/pipeline/status') is None:
+            return {"status": "error", "message": "MPS address not configured (start core.py with --mps)"}
+
+        if action == 'start':
+            if interval is None or interval == '':
+                interval = DEFAULT_CAPTURE_INTERVAL
+            try:
+                interval = float(interval)
+            except (TypeError, ValueError):
+                return {"status": "error", "message": f"Interval must be a number, got {interval!r}"}
+            if not (MIN_CAPTURE_INTERVAL <= interval <= MAX_CAPTURE_INTERVAL):
+                return {"status": "error",
+                        "message": (f"Interval must be between {MIN_CAPTURE_INTERVAL} and "
+                                    f"{MAX_CAPTURE_INTERVAL} seconds (got {interval})")}
+
+        with CAPTURE_CMD_LOCK:
+            if action == 'start':
+                # Authoritative guard. /pipeline/start/cc stops and restarts the
+                # pipeline, so starting while already running silently drops the
+                # in-flight session. Verified here, not just in the UI, so a
+                # stale tab or a raw curl cannot bypass it.
+                ok, payload = self._mps_status()
+                if not ok:
+                    return {"status": "error",
+                            "message": f"Cannot confirm MPS capture state ({payload}); not sending start."}
+                mode = payload.get('mode')
+                if payload.get('pipeline_running') or mode != 'idle':
+                    # Anything not "idle" counts as busy: server.py's CamState
+                    # comment says "distance_mode" but start_dm writes "dm", so
+                    # matching exact strings is fragile.
+                    return {"status": "error",
+                            "message": f"MPS is busy (mode '{mode}'); stop capture before starting."}
+                url = self._mps_url('/pipeline/start/cc')
+                kwargs = {"params": {"interval": interval}}
+            else:
+                url = self._mps_url('/pipeline/stop')
+                kwargs = {}
+
+            try:
+                resp = requests.post(url, timeout=CAPTURE_CMD_TIMEOUT, **kwargs)
+            except Exception as e:
+                return {"status": "error", "unknown_state": True,
+                        "message": (f"MPS did not respond in time ({type(e).__name__}); "
+                                    "capture state is UNKNOWN - verify on the MPS CLI before retrying.")}
+
+            if 200 <= resp.status_code < 300:
+                if action == 'start':
+                    print_green(f"[capture] Started continuous capture (interval={interval}s)")
+                    return {"status": "success", "message": f"Capture started ({interval}s interval)",
+                            "interval": interval}
+                print_green("[capture] Stopped continuous capture")
+                return {"status": "success", "message": "Capture stopped"}
+
+            body = (resp.text or "")[:300]
+            print_red(f"[capture] MPS rejected {action} (status={resp.status_code})")
+            return {"status": "error", "message": f"MPS returned {resp.status_code}: {body}"}
+
+    # --- Log source helpers -------------------------------------------------
+
+    def _resolve_log_source(self, source_id: str):
+        """Look up an allowlisted log source. Returns (entry, error_dict)."""
+        entry = (self.log_sources or {}).get(source_id)
+        if entry is None:
+            return None, {"ok": False, "reason": "unknown_source", "detail": source_id}
+        return entry, None
+
+    def _proxy_log_chunk(self, offset: int, gen: str, max_bytes: int) -> dict:
+        """Fetch a log chunk from MPS, with a circuit breaker.
+
+        The aircraft link carries image uploads, so a dead Pi must not be
+        re-dialled on every poll for the rest of the flight.
+        """
+        url = self._mps_url('/logs')
+        if url is None:
+            return {"ok": False, "reason": "unreachable", "detail": "MPS address not configured"}
+
+        now = time.time()
+        with _LOG_PROXY_LOCK:
+            if now < _LOG_PROXY_STATE["open_until"]:
+                remaining = int(_LOG_PROXY_STATE["open_until"] - now)
+                return {"ok": False, "reason": "unreachable",
+                        "detail": f"aircraft not responding; retrying in {remaining}s"}
+
+        try:
+            with LOG_PROXY_SEMAPHORE:
+                resp = requests.get(
+                    url,
+                    params={"offset": offset, "gen": gen, "max_bytes": max_bytes},
+                    timeout=LOG_PROXY_TIMEOUT,
+                )
+        except Exception as e:
+            with _LOG_PROXY_LOCK:
+                _LOG_PROXY_STATE["fails"] += 1
+                if _LOG_PROXY_STATE["fails"] >= LOG_PROXY_FAIL_THRESHOLD:
+                    _LOG_PROXY_STATE["open_until"] = time.time() + LOG_PROXY_COOLDOWN_S
+            return {"ok": False, "reason": "unreachable", "detail": type(e).__name__}
+
+        if resp.status_code == 404:
+            # Reached the aircraft, but it is running a build without /logs.
+            with _LOG_PROXY_LOCK:
+                _LOG_PROXY_STATE["fails"] = 0
+            return {"ok": False, "reason": "unsupported",
+                    "detail": "this MPS build has no /logs endpoint"}
+        if resp.status_code != 200:
+            return {"ok": False, "reason": "error", "detail": f"MPS returned {resp.status_code}"}
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return {"ok": False, "reason": "error", "detail": "malformed response from MPS"}
+
+        with _LOG_PROXY_LOCK:
+            _LOG_PROXY_STATE["fails"] = 0
+            _LOG_PROXY_STATE["open_until"] = 0.0
+        return payload
+
+    def _dm_presets(self) -> dict:
+        """List distance-mode presets available on the aircraft."""
+        url = self._mps_url('/pipeline/dm/presets')
+        if url is None:
+            return {"status": "error", "message": "MPS address not configured (start core.py with --mps)"}
+        try:
+            resp = requests.get(url, timeout=CAPTURE_STATUS_TIMEOUT)
+        except Exception as e:
+            return {"status": "error", "message": f"Could not reach MPS ({type(e).__name__})"}
+        if resp.status_code == 404:
+            return {"status": "error", "message": "This MPS build has no distance-mode presets"}
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"MPS returned {resp.status_code}"}
+        try:
+            return {"status": "success", "presets": resp.json().get("presets", [])}
+        except Exception:
+            return {"status": "error", "message": "Malformed preset list from MPS"}
+
+    def _dm_start(self, preset: str) -> dict:
+        """Start distance mode from a named preset, with the same busy guard as CC."""
+        if not preset:
+            return {"status": "error", "message": "No distance-mode preset selected"}
+        if self._mps_url('/pipeline/status') is None:
+            return {"status": "error", "message": "MPS address not configured (start core.py with --mps)"}
+
+        with CAPTURE_CMD_LOCK:
+            ok, payload = self._mps_status()
+            if not ok:
+                return {"status": "error",
+                        "message": f"Cannot confirm MPS state ({payload}); not starting distance mode."}
+            mode = payload.get('mode')
+            if payload.get('pipeline_running') or mode != 'idle':
+                # start/dm cancels any running DM and stops the pipeline, so the
+                # same anti-restart rule applies here as to continuous capture.
+                return {"status": "error",
+                        "message": f"MPS is busy (mode '{mode}'); stop it before starting distance mode."}
+
+            url = self._mps_url('/pipeline/start/dm/preset/' + preset)
+            try:
+                resp = requests.post(url, timeout=CAPTURE_CMD_TIMEOUT)
+            except Exception as e:
+                return {"status": "error", "unknown_state": True,
+                        "message": (f"MPS did not respond in time ({type(e).__name__}); "
+                                    "state is UNKNOWN - verify on the MPS CLI.")}
+            if resp.status_code == 404:
+                return {"status": "error", "message": f"Unknown preset '{preset}' on the aircraft"}
+            if not (200 <= resp.status_code < 300):
+                return {"status": "error", "message": f"MPS returned {resp.status_code}: {(resp.text or '')[:300]}"}
+            print_green(f"[capture] Started distance mode (preset={preset})")
+            return {"status": "success", "message": f"Distance mode started ({preset})"}
 
     def _handle_result_push(self):
         """Handle POST /api/result — cloud server pushes a detection result here."""
@@ -782,6 +1231,29 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     response = {"status": "error", "message": f"Failed to clear local exports: {e}"}
                     print_red(f"[api] clear_exports failed: {e}")
+            elif command == 'capture_start':
+                try:
+                    response = self._capture_command('start', data.get('interval'))
+                except Exception as e:
+                    response = {"status": "error", "message": f"capture_start failed: {e}"}
+                    print_red(f"[api] capture_start failed: {e}")
+            elif command == 'capture_stop':
+                try:
+                    response = self._capture_command('stop')
+                except Exception as e:
+                    response = {"status": "error", "message": f"capture_stop failed: {e}"}
+                    print_red(f"[api] capture_stop failed: {e}")
+            elif command == 'dm_presets':
+                try:
+                    response = self._dm_presets()
+                except Exception as e:
+                    response = {"status": "error", "message": f"dm_presets failed: {e}"}
+            elif command == 'dm_start':
+                try:
+                    response = self._dm_start(data.get('preset'))
+                except Exception as e:
+                    response = {"status": "error", "message": f"dm_start failed: {e}"}
+                    print_red(f"[api] dm_start failed: {e}")
             else:
                 response = {"status": "error", "message": f"Unknown command: {command}"}
             

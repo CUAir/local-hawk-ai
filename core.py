@@ -45,11 +45,18 @@ def _ensure_export_dir() -> bool:
         return False
 
 
+# Path of this run's log file, published module-level so the log-panel source
+# resolver can reach it (the filename embeds the start timestamp).
+CURRENT_LOG_PATH: Path = None
+
+
 def _setup_file_logging() -> Path:
+    global CURRENT_LOG_PATH
     logs_dir = Path(__file__).parent / "logs"
     logs_dir.mkdir(exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_path = logs_dir / f"local_hawk_ai_{date_str}.log"
+    CURRENT_LOG_PATH = log_path
     handler = logging.FileHandler(log_path)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s"))
     logging.getLogger().addHandler(handler)
@@ -1022,12 +1029,20 @@ class VisionClient:
             print_yellow("[gd_backup] No tent candidate found in current image")
 
 
-def start_server(mapper: Mapper, result_store: ResultStore, port=8080):
+def start_server(mapper: Mapper, result_store: ResultStore, port=8080,
+                 mps_base_url: str = None, log_sources: dict = None):
     header(f"\n[server] API/command HTTP server started on port {port}")
 
     # Set the mapper and result_store in the handler class
     MapCommandHandler.mapper = mapper
     MapCommandHandler.result_store = result_store
+    MapCommandHandler.mps_base_url = mps_base_url
+    MapCommandHandler.log_sources = log_sources or {}
+
+    if mps_base_url:
+        header(f"[capture] Capture controls enabled, MPS at {mps_base_url}")
+    else:
+        print_yellow("[capture] Capture controls disabled (start with --mps to enable)")
 
     # Create and start the HTTP server
     server = ThreadingHTTPServer(('0.0.0.0', port), MapCommandHandler)
@@ -1090,6 +1105,46 @@ def cloud_map_monitor_loop(mapper: Mapper, interval_seconds: float):
         time.sleep(interval_seconds)
 
 
+def _build_log_sources(gs_backend_log: str, mps_address: str = None) -> dict:
+    """Allowlist of tailable log files, keyed by id.
+
+    Paths are resolved once here; the handler re-checks at read time. A source
+    whose file does not exist yet is still listed (so the tab appears, greyed)
+    because gs-backend only creates logs/server.log on first run.
+    """
+    sources = {}
+
+    if CURRENT_LOG_PATH is not None:
+        sources['lhai'] = {
+            "label": "local-hawk-ai",
+            "kind": "file",
+            "path": Path(CURRENT_LOG_PATH).resolve(),
+        }
+
+    if gs_backend_log:
+        try:
+            sources['gsbackend'] = {
+                "label": "gs-backend",
+                "kind": "file",
+                # Not resolve(strict=True): the file may not exist until
+                # gs-backend has served its first request.
+                "path": Path(gs_backend_log).expanduser().resolve(),
+            }
+        except Exception as e:
+            print_yellow(f"[logs] Ignoring --gs-backend-log ({gs_backend_log}): {e}")
+
+    # The aircraft log is fetched over HTTP, not read from disk. Only offered
+    # when --mps is set, so the tab simply does not appear otherwise.
+    if mps_address:
+        sources['mps'] = {
+            "label": "MPS (aircraft)",
+            "kind": "proxy",
+            "path": None,
+        }
+
+    return sources
+
+
 def main(
     gs_ip_address: str,
     cs_ip_address: str,
@@ -1100,6 +1155,8 @@ def main(
     autopilot_host: str = None,
     mapping_only: bool = False,
     enable_map_idle_trigger: bool = False,
+    mps_address: str = None,
+    gs_backend_log: str = None,
 ):
     log_path = _setup_file_logging()
     logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
@@ -1116,8 +1173,14 @@ def main(
     # Initialize mapping session directory (wipes stale data, creates clean dirs)
     _reset_session()
 
+    log_sources = _build_log_sources(gs_backend_log, mps_address)
+
     # Start the API/command HTTP server in a background thread so it runs concurrently
-    threading.Thread(target=start_server, args=(mapper, result_store, server_port), daemon=True).start()
+    threading.Thread(
+        target=start_server,
+        args=(mapper, result_store, server_port, mps_address, log_sources),
+        daemon=True,
+    ).start()
 
     # Start the frontend HTTP server in its own background thread
     threading.Thread(target=start_frontend_server, args=(frontend_port, server_port), daemon=True).start()
@@ -1195,6 +1258,13 @@ if __name__ == "__main__":
                         help="Run only map server + mapping trigger logic (disable worker loop logs)")
     parser.add_argument('--enable-map-idle-trigger', action='store_true',
                         help="Enable automatic idle-time mapping trigger (disabled by default)")
+    parser.add_argument('--mps', type=str, default=None,
+                        help="MPS (aircraft) address for dashboard capture controls, e.g. 192.168.1.10:8000. "
+                             "Omit to disable capture controls entirely.")
+    parser.add_argument('--gs-backend-log', type=str,
+                        default=str(Path(__file__).resolve().parent.parent / 'gs-backend' / 'logs' / 'server.log'),
+                        help="Path to gs-backend's logs/server.log for the log panel "
+                             "(default: sibling gs-backend checkout)")
 
     args = parser.parse_args()
 
@@ -1217,4 +1287,6 @@ if __name__ == "__main__":
         a_ip_address,
         args.mapping_only,
         args.enable_map_idle_trigger,
+        args.mps,
+        args.gs_backend_log,
     )

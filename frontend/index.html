@@ -105,7 +105,9 @@
       border-radius: 999px; padding: 2px 9px; min-width: 20px; text-align: center;
     }
 
-    .log { max-height: calc(100vh - 200px); overflow-y: auto; padding-right: 4px; }
+    /* The subtrahend tracks everything stacked above the columns: topbar,
+       #admin-status, and #cap-bar. Adjust it if that stack changes height. */
+    .log { max-height: calc(100vh - 244px); overflow-y: auto; padding-right: 4px; }
 
     .card {
       border: 1px solid var(--border); border-radius: 10px;
@@ -216,10 +218,86 @@
     .gs-loc .hero-key { font-size: 11px; color: var(--muted); margin-bottom: 4px; letter-spacing: .05em; }
     .gs-loc .alt-row { font-size: 12px; margin-top: 8px; color: var(--muted); font-family: var(--mono); }
 
+    /* --- Capture controls -------------------------------------------- */
+    .btn-accent { color: var(--accent); border-color: rgba(52,211,153,.35); }
+    .btn-accent:hover:not(:disabled) { background: var(--accent-dim); }
+
+    #cap-bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 2px 20px 10px; font-size: 12.5px; color: var(--muted);
+    }
+    .cap-label { font-weight: 600; color: var(--text); }
+    .cap-pill {
+      font-family: var(--mono); font-size: 11px; padding: 3px 9px;
+      border-radius: 999px; border: 1px solid var(--border);
+      background: var(--surface-2); color: var(--muted);
+    }
+    .cap-pill.on   { color: var(--accent); border-color: rgba(52,211,153,.4); background: var(--accent-dim); }
+    /* Armed and healthy but not firing (distance mode waiting for the geofence).
+       Deliberately not amber: that reads as caution, and this is normal. */
+    .cap-pill.armed { color: var(--blue); border-color: rgba(96,165,250,.4); background: rgba(96,165,250,.10); }
+    .cap-pill.busy { color: var(--amber);  border-color: rgba(251,191,36,.4); }
+    .cap-pill.off  { color: var(--red);    border-color: rgba(248,113,113,.4); }
+    .cap-num {
+      width: 62px; background: var(--surface-2); border: 1px solid var(--border);
+      color: var(--text); border-radius: 6px; padding: 4px 7px;
+      font-size: 12px; font-family: var(--mono);
+    }
+    .cap-num:disabled { opacity: .45; }
+    .cap-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+    #dm-preset {
+      background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 4px 7px; font-size: 12px;
+    }
+    #dm-preset:disabled { opacity: .45; }
+    #cap-status { font-size: 12px; padding: 0; }
+
+    /* --- Service log panel -------------------------------------------- */
+    /* Deliberately NOT named .log: that class carries a
+       max-height: calc(100vh - 200px) tuned to the columns. */
+    .logpanel { padding: 0 20px 28px; }
+    .logpanel > details {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    }
+    .logpanel > details > summary {
+      cursor: pointer; padding: 10px 14px; font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 10px; list-style: none;
+    }
+    .logpanel > details > summary::-webkit-details-marker { display: none; }
+    .logpanel > details > summary::before { content: '▸'; color: var(--muted); font-size: 11px; }
+    .logpanel > details[open] > summary::before { content: '▾'; }
+    .logpanel-state { font-family: var(--mono); font-size: 11px; color: var(--muted); font-weight: 400; }
+    .logpanel-body { padding: 0 14px 14px; }
+    .logpanel-tabs {
+      display: flex; gap: 6px; flex-wrap: wrap;
+      border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 10px;
+    }
+    .logtab { font-size: 12px; padding: 5px 11px; }
+    .logtab[aria-selected="true"] {
+      color: var(--accent); border-color: rgba(52,211,153,.45); background: var(--accent-dim);
+    }
+    .logpanel-controls {
+      display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px;
+    }
+    .logpanel-controls input[type=text] {
+      background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 4px 8px; font-size: 12px; font-family: var(--mono);
+    }
+    .logpanel-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-left: auto; }
+    .logpanel-out {
+      font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+      background: #06090c; border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; margin: 0; height: 40vh; min-height: 200px;
+      overflow: auto; white-space: pre; color: var(--text);
+    }
+    .logpanel-out.empty-state { color: var(--muted); white-space: pre-wrap; }
+
     @media (max-width: 720px) {
       .topbar { padding: 12px 14px; }
       .board { padding: 14px; grid-template-columns: 1fr; }
       .gs-loc .hero-val { font-size: 22px; }
+      .logpanel { padding: 0 14px 20px; }
+      .logpanel-out { height: 50vh; }
     }
   </style>
 </head>
@@ -245,6 +323,24 @@
     </div>
   </div>
   <div id="admin-status" class="action-status"></div>
+  <div id="cap-bar">
+    <span class="cap-label">Continuous capture</span>
+    <span id="cap-pill" class="cap-pill">checking…</span>
+    <label class="control">
+      <span>Every</span>
+      <input id="cap-interval" class="cap-num" type="number" min="0.5" max="60" step="0.5" value="2" />
+      <span>s</span>
+    </label>
+    <button id="cap-start" class="btn btn-accent" disabled>Start Capture</button>
+    <button id="cap-stop" class="btn btn-danger" disabled>Stop</button>
+    <span class="cap-sep"></span>
+    <label class="control">
+      <span>Distance mode</span>
+      <select id="dm-preset" disabled><option value="">loading…</option></select>
+    </label>
+    <button id="dm-start" class="btn btn-accent" disabled>Start DM</button>
+    <span id="cap-status" class="action-status"></span>
+  </div>
   <div id="notifications"></div>
 
   <main class="board">
@@ -288,6 +384,30 @@
       <div class="log" id="gs-panel"><div class="skeleton">Loading…</div></div>
     </section>
   </main>
+
+  <section class="logpanel" aria-label="Service logs">
+    <details id="logpanel-details">
+      <summary>
+        <span>Service Logs</span>
+        <span class="logpanel-state" id="logpanel-state">collapsed</span>
+      </summary>
+      <div class="logpanel-body">
+        <div class="logpanel-tabs" id="logpanel-tabs" role="tablist"></div>
+        <div class="logpanel-controls">
+          <label class="control checkbox">
+            <input id="logpanel-follow" type="checkbox" checked /><span>Follow</span>
+          </label>
+          <label class="control">
+            <span>Filter</span>
+            <input id="logpanel-filter" type="text" placeholder="substring" />
+          </label>
+          <button id="logpanel-clear" class="btn">Clear</button>
+          <span class="logpanel-meta" id="logpanel-meta"></span>
+        </div>
+        <pre class="logpanel-out" id="logpanel-out"></pre>
+      </div>
+    </details>
+  </section>
 
 <script>
 const API_BASE = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
@@ -821,6 +941,433 @@ async function fetchBest() {
   } catch (e) {
     console.warn('SSE not available');
   }
+</script>
+
+<!-- Capture controls. A separate script element on purpose: each one is
+     compiled independently, so a syntax error here cannot blank the dashboard. -->
+<script>
+(function () {
+  'use strict';
+  var API = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
+  var pill = document.getElementById('cap-pill');
+  var btnStart = document.getElementById('cap-start');
+  var btnStop = document.getElementById('cap-stop');
+  var statusEl = document.getElementById('cap-status');
+  var intervalEl = document.getElementById('cap-interval');
+  var dmSelect = document.getElementById('dm-preset');
+  var dmStart = document.getElementById('dm-start');
+  if (!pill || !btnStart || !btnStop || !statusEl) return;
+
+  var presetsLoaded = false;
+
+  function setInterval_(disabled) { if (intervalEl) intervalEl.disabled = disabled; }
+  // Distance mode is gated identically to continuous capture: starting it
+  // cancels whatever is running, so it is only offered when MPS is idle.
+  function setDm(disabled) {
+    if (dmSelect) dmSelect.disabled = disabled || !presetsLoaded;
+    if (dmStart) dmStart.disabled = disabled || !presetsLoaded || !(dmSelect && dmSelect.value);
+  }
+
+  var POLL_MS = 3000;
+  var STALE_MS = 8000;
+  var last = null;          // last successful status payload
+  var lastAt = 0;           // when we received it
+  var busy = false;         // a command is in flight
+
+  function say(msg, kind) {
+    statusEl.textContent = msg || '';
+    statusEl.className = 'action-status' + (kind ? ' ' + kind : '');
+  }
+
+  function setPill(text, cls) {
+    pill.textContent = text;
+    pill.className = 'cap-pill' + (cls ? ' ' + cls : '');
+  }
+
+  // Buttons are enabled only by a fresh, successful, unambiguous status. On
+  // anything else they stay disabled, so the UI cannot fire blind.
+  function render() {
+    if (busy) { btnStart.disabled = true; btnStop.disabled = true; setInterval_(true); setDm(true); return; }
+    if (!last) { setPill('checking…', ''); btnStart.disabled = true; btnStop.disabled = true; setInterval_(true); setDm(true); return; }
+    if (last.configured === false) {
+      setPill('not configured', '');
+      btnStart.disabled = true; btnStop.disabled = true; setInterval_(true); setDm(true);
+      return;
+    }
+    if (!last.reachable) {
+      setPill('MPS unreachable', 'off');
+      btnStart.disabled = true; btnStop.disabled = true; setInterval_(true); setDm(true);
+      return;
+    }
+    if (Date.now() - lastAt > STALE_MS) {
+      setPill('status stale', 'off');
+      btnStart.disabled = true; btnStop.disabled = true; setInterval_(true); setDm(true);
+      return;
+    }
+    var running = !!last.pipeline_running;
+    var mode = last.mode;
+
+    // Only "idle and not running" enables Start. Every branch below disables it,
+    // so an unrecognised mode fails safe rather than allowing a restart.
+    function busyUi() {
+      btnStart.disabled = true; btnStop.disabled = false; setInterval_(true); setDm(true);
+    }
+
+    if (mode === 'dm') {
+      // Distance mode stays armed for the whole flight; pipeline_running is what
+      // flips as the aircraft crosses the geofence. Distinguishing the two is the
+      // most useful thing on this bar during a pass.
+      if (running) setPill('distance mode · capturing', 'on');
+      else setPill('distance mode · waiting', 'armed');
+      busyUi();
+    } else if (mode === 'cc') {
+      if (running) setPill('capturing', 'on');
+      // Mode says cc but the task is not alive: either the first tick has not
+      // landed yet, or the capture task died and nothing reset state.mode.
+      else setPill('capture not running', 'busy');
+      busyUi();
+    } else if (running) {
+      // Running while mode reports idle. Drift the other way; still treat as busy.
+      setPill('capturing (mode: idle)', 'busy');
+      busyUi();
+    } else if (mode !== 'idle') {
+      setPill('MPS busy: ' + mode, 'busy');
+      busyUi();
+    } else {
+      setPill('idle', '');
+      btnStart.disabled = false; btnStop.disabled = false; setInterval_(false); setDm(false);
+    }
+  }
+
+  function poll() {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, POLL_MS);
+    return fetch(API + '/api/capture/status', { signal: ctl.signal })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        last = d; lastAt = Date.now();
+        if (!presetsLoaded && d && d.configured && d.reachable) loadPresets();
+      })
+      .catch(function () { /* leave `last` alone; staleness check handles it */ })
+      .then(function () { clearTimeout(t); render(); });
+  }
+
+  function loadPresets() {
+    if (presetsLoaded) return;
+    presetsLoaded = true;   // set first so a slow reply cannot queue a second fetch
+    fetch(API + '/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'dm_presets' })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!dmSelect) return;
+        dmSelect.textContent = '';
+        if (d.status !== 'success' || !d.presets || !d.presets.length) {
+          presetsLoaded = false;
+          var o = document.createElement('option');
+          o.value = ''; o.textContent = 'unavailable';
+          dmSelect.appendChild(o);
+          return;
+        }
+        d.presets.forEach(function (p) {
+          var o = document.createElement('option');
+          o.value = p.id;
+          o.textContent = p.label + ' (' + p.area_count + ' area'
+            + (p.area_count === 1 ? '' : 's') + ', r=' + p.plane_radius + 'm)';
+          dmSelect.appendChild(o);
+        });
+        render();
+      })
+      .catch(function () { presetsLoaded = false; });
+  }
+
+  function send(command) {
+    busy = true; render(); say('Working…', '');
+    var payload = { command: command };
+    if (command === 'capture_start' && intervalEl) payload.interval = intervalEl.value;
+    if (command === 'dm_start' && dmSelect) payload.preset = dmSelect.value;
+    return fetch(API + '/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.status === 'success') { say(d.message || 'Done', 'success'); }
+        else {
+          say((d && d.message) || 'Command failed', 'error');
+          // A timed-out command may or may not have taken effect. Force the UI
+          // back to unknown so the operator cannot blind-retry a possible start.
+          if (d && d.unknown_state) { last = null; }
+        }
+      })
+      .catch(function (e) { say('Request failed: ' + e, 'error'); last = null; })
+      .then(function () {
+        busy = false;
+        return poll();
+      });
+  }
+
+  btnStart.addEventListener('click', function () {
+    // Re-verify immediately before sending. This closes the window between the
+    // last poll and the click; the server checks again authoritatively.
+    say('Checking MPS state…', '');
+    poll().then(function () {
+      if (!last || !last.reachable || last.pipeline_running || last.mode !== 'idle') {
+        say('MPS is not idle; not starting.', 'error');
+        return;
+      }
+      send('capture_start');
+    });
+  });
+
+  btnStop.addEventListener('click', function () {
+    if (!confirm('Stop continuous capture? The aircraft will stop taking images.')) return;
+    send('capture_stop');
+  });
+
+  if (dmSelect) dmSelect.addEventListener('change', function () { render(); });
+  if (dmStart) dmStart.addEventListener('click', function () {
+    var label = dmSelect.options[dmSelect.selectedIndex];
+    if (!confirm('Start distance mode at ' + (label ? label.textContent : dmSelect.value)
+                 + '?\n\nCapture will begin automatically when the aircraft enters a search area.')) return;
+    say('Checking MPS state…', '');
+    poll().then(function () {
+      if (!last || !last.reachable || last.pipeline_running || last.mode !== 'idle') {
+        say('MPS is not idle; not starting distance mode.', 'error');
+        return;
+      }
+      send('dm_start');
+    });
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) poll();
+  });
+
+  poll();
+  setInterval(function () { if (!document.hidden && !busy) poll(); }, POLL_MS);
+})();
+</script>
+
+<!-- Service log panel. Also isolated in its own script element. -->
+<script>
+(function () {
+  'use strict';
+  var API = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
+  var details = document.getElementById('logpanel-details');
+  var tabsEl = document.getElementById('logpanel-tabs');
+  var outEl = document.getElementById('logpanel-out');
+  var stateEl = document.getElementById('logpanel-state');
+  var metaEl = document.getElementById('logpanel-meta');
+  var followEl = document.getElementById('logpanel-follow');
+  var filterEl = document.getElementById('logpanel-filter');
+  var clearEl = document.getElementById('logpanel-clear');
+  if (!details || !tabsEl || !outEl) return;
+
+  var MAX_LINES = 2000;
+  var POLL_MS = 2000;
+  var MAX_BACKOFF_MS = 30000;
+
+  var sources = [];
+  var states = {};        // per-source: lines, offset, gen, follow, filter, scrollTop
+  var active = null;
+  var timer = null;
+  var ctl = null;
+  var loaded = false;
+  var backoff = POLL_MS;
+
+  function stateFor(id) {
+    if (!states[id]) {
+      states[id] = { lines: [], offset: 0, gen: '', follow: true, filter: '', scrollTop: -1, note: '' };
+    }
+    return states[id];
+  }
+
+  function setState(txt) { if (stateEl) stateEl.textContent = txt; }
+
+  function render() {
+    var st = stateFor(active);
+    var lines = st.lines;
+    if (st.filter) {
+      var needle = st.filter.toLowerCase();
+      lines = lines.filter(function (l) { return l.toLowerCase().indexOf(needle) !== -1; });
+    }
+    var atBottom = outEl.scrollHeight - outEl.scrollTop - outEl.clientHeight < 40;
+    // textContent, never innerHTML: gs-backend's access log echoes the request
+    // URI, so any LAN client could otherwise inject markup into this page.
+    if (!lines.length) {
+      outEl.textContent = st.note || 'No log output yet.';
+      outEl.classList.add('empty-state');
+    } else {
+      outEl.textContent = lines.join('\n');
+      outEl.classList.remove('empty-state');
+    }
+    if (metaEl) {
+      metaEl.textContent = st.lines.length + ' lines'
+        + (st.filter ? ' (' + lines.length + ' shown)' : '');
+    }
+    if (st.follow && (atBottom || st.scrollTop < 0)) {
+      outEl.scrollTop = outEl.scrollHeight;
+    }
+  }
+
+  function push(st, arr) {
+    for (var i = 0; i < arr.length; i++) st.lines.push(arr[i]);
+    if (st.lines.length > MAX_LINES) st.lines.splice(0, st.lines.length - MAX_LINES);
+  }
+
+  function tick() {
+    if (!details.open || !active || document.hidden) return;
+    var st = stateFor(active);
+    var id = active;
+    ctl = new AbortController();
+    var url = API + '/api/logs?source=' + encodeURIComponent(id)
+      + '&offset=' + st.offset + '&gen=' + encodeURIComponent(st.gen);
+    fetch(url, { signal: ctl.signal })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (id !== active) return;   // tab changed mid-flight; drop the result
+        if (!d.ok) {
+          st.note = 'Log unavailable (' + d.reason + ')' + (d.detail ? ': ' + d.detail : '');
+          setState(d.reason);
+          backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+          render();
+          return;
+        }
+        backoff = POLL_MS;
+        if (d.reset) {
+          st.lines = [];
+          if (d.dropped_bytes) {
+            push(st, ['── skipped ' + Math.round(d.dropped_bytes / 1024) + ' KB of earlier output ──']);
+          } else {
+            push(st, ['── log reset (service restarted) ──']);
+          }
+        } else if (d.dropped_bytes) {
+          push(st, ['── skipped ' + Math.round(d.dropped_bytes / 1024) + ' KB ──']);
+        }
+        st.offset = d.offset; st.gen = d.gen; st.note = '';
+        if (d.lines && d.lines.length) push(st, d.lines);
+        setState('live');
+        render();
+      })
+      .catch(function () {
+        if (id !== active) return;
+        setState('unreachable');
+        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      })
+      .then(function () {
+        if (details.open && id === active) schedule();
+      });
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(tick, backoff);
+  }
+
+  function stop() {
+    clearTimeout(timer);
+    timer = null;
+    if (ctl) { try { ctl.abort(); } catch (e) {} ctl = null; }
+  }
+
+  function selectSource(id) {
+    if (active === id) return;
+    stop();                       // never leave two polls outstanding
+    if (active) stateFor(active).scrollTop = outEl.scrollTop;
+    active = id;
+    backoff = POLL_MS;
+    var st = stateFor(id);
+    if (followEl) followEl.checked = st.follow;
+    if (filterEl) filterEl.value = st.filter;
+    Array.prototype.forEach.call(tabsEl.children, function (b) {
+      b.setAttribute('aria-selected', String(b.dataset.id === id));
+    });
+    render();
+    if (st.scrollTop >= 0) outEl.scrollTop = st.scrollTop;
+    try { localStorage.setItem('logpanel.active', id); } catch (e) {}
+    tick();
+  }
+
+  function buildTabs() {
+    tabsEl.textContent = '';
+    sources.forEach(function (s) {
+      var b = document.createElement('button');
+      b.className = 'btn logtab';
+      b.textContent = s.label + (s.available ? '' : ' (n/a)');
+      b.dataset.id = s.id;
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', 'false');
+      if (!s.available) { b.disabled = true; b.title = s.detail || 'unavailable'; }
+      b.addEventListener('click', function () { selectSource(s.id); });
+      tabsEl.appendChild(b);
+    });
+  }
+
+  function loadSources() {
+    setState('loading…');
+    return fetch(API + '/api/logs/sources')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        sources = (d && d.sources) || [];
+        loaded = true;
+        buildTabs();
+        if (!sources.length) { setState('no sources'); outEl.textContent = 'No log sources configured.'; return; }
+        var saved = null;
+        try { saved = localStorage.getItem('logpanel.active'); } catch (e) {}
+        var pick = sources.filter(function (s) { return s.id === saved && s.available; })[0]
+          || sources.filter(function (s) { return s.available; })[0]
+          || sources[0];
+        selectSource(pick.id);
+      })
+      .catch(function (e) { setState('failed'); outEl.textContent = 'Could not load log sources: ' + e; });
+  }
+
+  // Everything network-related hangs off this handler. Collapsed panel = no
+  // requests at all, including the source list, which is fetched lazily here
+  // rather than at page load.
+  details.addEventListener('toggle', function () {
+    try { localStorage.setItem('logpanel.open', details.open ? '1' : '0'); } catch (e) {}
+    if (details.open) {
+      setState('starting…');
+      if (!loaded) loadSources(); else { backoff = POLL_MS; tick(); }
+    } else {
+      stop();
+      setState('collapsed');
+    }
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) stop();
+    else if (details.open && active) { backoff = POLL_MS; tick(); }
+  });
+
+  if (followEl) followEl.addEventListener('change', function () {
+    if (active) stateFor(active).follow = followEl.checked;
+  });
+  if (filterEl) filterEl.addEventListener('input', function () {
+    if (!active) return;
+    stateFor(active).filter = filterEl.value.trim();
+    render();
+  });
+  if (clearEl) clearEl.addEventListener('click', function () {
+    if (!active) return;
+    stateFor(active).lines = [];
+    render();
+  });
+  outEl.addEventListener('scroll', function () {
+    if (!active || !followEl) return;
+    var atBottom = outEl.scrollHeight - outEl.scrollTop - outEl.clientHeight < 40;
+    if (!atBottom && followEl.checked) { followEl.checked = false; stateFor(active).follow = false; }
+  });
+
+  try {
+    if (localStorage.getItem('logpanel.open') === '1') details.open = true;
+  } catch (e) {}
+})();
 </script>
 </body>
 </html>
