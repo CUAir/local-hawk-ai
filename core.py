@@ -26,7 +26,7 @@ import time
 import threading
 import logging
 from constructs.image_types import Base64Image, LabelTypes, ImageMeta, GeoLocation, CandidateImage
-from constructs.projection import GroundProjector
+from constructs.geotagging import geotag_candidate
 
 
 # Keep color only for section headers; all other logs are plain text.
@@ -258,8 +258,6 @@ class VisionClient:
             self.autopilot_url = f"http://{autopilot_host}/target"
         # incremental id for autopilot messages
         self._autopilot_id = 0
-        # projector for ground coordinates
-        self._projector = GroundProjector()
 
         self.result_interval_seconds = max(1.0, float(result_interval_seconds))
         self._send_lock = threading.Lock()
@@ -306,7 +304,7 @@ class VisionClient:
             # loop repeats after interval
 
     def _build_candidate_from_entry(self, assignment: dict, roi: ROI, classification: Classification, meta_filename: str = None, base64_override: str = None) -> CandidateImage:
-        """Construct a CandidateImage (with Base64Image.source.meta) suitable for GroundProjector.project()."""
+        """Construct a CandidateImage (with Base64Image.source.meta) suitable for geotag_candidate()."""
         # Try to get base64 full image from meta file
         b64 = None
         try:
@@ -406,15 +404,15 @@ class VisionClient:
                 print_red(f"[autopilot] Failed to build candidate for projection: {e}")
                 cand = None
 
-            lat = None; lon = None
-            if cand is not None:
-                try:
-                    proj = self._projector.project(cand)
-                    if proj:
-                        lat = proj.lat
-                        lon = proj.lon
-                except Exception as e:
-                    print_red(f"[autopilot] Projection error: {e}")
+                lat = None; lon = None
+                if cand is not None:
+                    try:
+                        geo = geotag_candidate(cand)
+                        if geo:
+                            lat = geo.lat
+                            lon = geo.lon
+                    except Exception as e:
+                        print_red(f"[autopilot] Geotagging error: {e}")
 
             if lat is None or lon is None:
                 msg = f"Could not determine lat/lon for {target_type_str}; skipping send"
