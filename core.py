@@ -467,15 +467,15 @@ class VisionClient:
                 print_red(f"[autopilot] Failed to build candidate for projection: {e}")
                 cand = None
 
-                lat = None; lon = None
-                if cand is not None:
-                    try:
-                        geo = geotag_candidate(cand)
-                        if geo:
-                            lat = geo.lat
-                            lon = geo.lon
-                    except Exception as e:
-                        print_red(f"[autopilot] Geotagging error: {e}")
+            lat = None; lon = None
+            if cand is not None:
+                try:
+                    geo = geotag_candidate(cand)
+                    if geo:
+                        lat = geo.lat
+                        lon = geo.lon
+                except Exception as e:
+                    print_red(f"[autopilot] Geotagging error: {e}")
 
             if lat is None or lon is None:
                 msg = f"Could not determine lat/lon for {target_type_str}; skipping send"
