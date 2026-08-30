@@ -346,6 +346,9 @@
     </label>
     <button id="dm-start" class="btn btn-accent" disabled>Start DM</button>
     <span id="cap-status" class="action-status"></span>
+    <span class="cap-sep"></span>
+    <span class="cap-label">Last image taken</span>
+    <span id="last-image-ts" class="action-status">N/A</span>
   </div>
   <div id="notifications"></div>
 
@@ -688,6 +691,15 @@ async function fetchBest() {
 
     const tentList = best.tent || [];
     const manList = best.mannequin || [];
+
+    const lastImageEl = document.getElementById('last-image-ts');
+    if (lastImageEl) {
+      const lastPull = (best.gs || [])[0] || null;
+      const capturedAt = lastPull && lastPull.assignment && lastPull.assignment.image
+        ? lastPull.assignment.image.timestamp
+        : null;
+      lastImageEl.textContent = capturedAt ? fmtTs(capturedAt) : 'N/A';
+    }
 
     // Use explicit to_send fields only (guaranteed to match send_result logic)
     const currentBestTent = best.to_send_tent_meta || null;
