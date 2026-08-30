@@ -318,7 +318,7 @@ class VisionClient:
         self.autopilot_host = autopilot_host
         self.autopilot_url = None
         if autopilot_host:
-            self.autopilot_url = f"http://{autopilot_host}/target"
+            self.autopilot_url = f"http://{autopilot_host}/targets_set"
         # incremental id for autopilot messages
         self._autopilot_id = 0
 
