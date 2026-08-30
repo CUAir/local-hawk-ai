@@ -324,6 +324,7 @@
       <div class="admin-actions">
         <button id="btn-check-cloud" class="btn btn-info">Check Cloud Status</button>
         <button id="btn-clear-cloud" class="btn btn-danger">Clear Cloud Server</button>
+        <button id="btn-clear-gs" class="btn btn-danger">Clear Ground Server</button>
         <button id="btn-clear-exports" class="btn btn-danger">Delete Local Saved Images</button>
       </div>
     </div>
@@ -852,6 +853,17 @@ async function fetchBest() {
         'clear_cloud',
         'Clear the cloud server’s in-memory best images and mapping queue? This cannot be undone.',
         btnClearCloud,
+      );
+    });
+  }
+
+  const btnClearGs = document.getElementById('btn-clear-gs');
+  if (btnClearGs) {
+    btnClearGs.addEventListener('click', () => {
+      runAdminCommand(
+        'clear_gs',
+        'Clear the ground server’s database (images, targets, telemetry, assignments) and image directory? This cannot be undone.',
+        btnClearGs,
       );
     });
   }

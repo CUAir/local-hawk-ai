@@ -26,7 +26,9 @@ class BertModelWarper(nn.Module):
 
         self.get_extended_attention_mask = bert_model.get_extended_attention_mask
         self.invert_attention_mask = bert_model.invert_attention_mask
-        self.get_head_mask = bert_model.get_head_mask
+        # transformers>=5 removed BertModel.get_head_mask; forward() below only
+        # ever calls it with head_mask=None (no caller in this repo passes a real
+        # mask), so it's inlined at the one call site instead of bound here.
 
     def forward(
         self,
@@ -128,7 +130,9 @@ class BertModelWarper(nn.Module):
         # attention_probs has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        # head_mask is always None here (see __init__ comment); this matches
+        # transformers<5's get_head_mask(None, n) return value exactly.
+        head_mask = [None] * self.config.num_hidden_layers
 
         embedding_output = self.embeddings(
             input_ids=input_ids,

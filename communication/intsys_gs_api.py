@@ -1256,6 +1256,20 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     response = {"status": "error", "message": f"Failed to clear cloud: {e}"}
                     print_red(f"[api] clear_cloud failed: {e}")
+            elif command == 'clear_gs':
+                try:
+                    work_client = getattr(self.mapper, 'work_client', None)
+                    if work_client is None:
+                        response = {"status": "error", "message": "work_client not available"}
+                    else:
+                        gs_resp = work_client.clear_gs()
+                        if 200 <= gs_resp.status_code < 300:
+                            response = {"status": "success", "message": "Ground server cleared"}
+                        else:
+                            response = {"status": "error", "message": f"Ground server returned status {gs_resp.status_code}"}
+                except Exception as e:
+                    response = {"status": "error", "message": f"Failed to clear ground server: {e}"}
+                    print_red(f"[api] clear_gs failed: {e}")
             elif command == 'send_to_autopilot':
                 meta_filename = data.get('meta_filename')
                 vision_client = getattr(self, 'vision_client', None)

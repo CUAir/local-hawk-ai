@@ -352,6 +352,8 @@ class VisionClient:
         self.autopilot_host = autopilot_host
         self.autopilot_url = None
         if autopilot_host:
+            # Project-Emu's mavproxy_cuairapi exposes POST /targets_set, not /target
+            # (mavproxy_cuairapi/views/targets.py) — no /target route exists anywhere.
             self.autopilot_url = f"http://{autopilot_host}/targets_set"
         # incremental id for autopilot messages
         self._autopilot_id = 0
@@ -516,11 +518,18 @@ class VisionClient:
                 print_red(f"[autopilot] {msg}")
                 return {"status": "error", "message": msg}
 
+            # Shape required by Project-Emu's pathplanning.update_targets(), which
+            # reads target['geotag']['gpsLocation']['latitude'/'longitude'] — a flat
+            # {lat, lng, ...} body raises a KeyError there (caught, returns 500).
             payload = {
-                "lat": float(lat),
-                "lng": float(lon),
-                "target_type": target_type_str,
                 "id": int(self._autopilot_id),
+                "geotag": {
+                    "id": int(self._autopilot_id),
+                    "gpsLocation": {
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                    },
+                },
             }
             print("PAYLOAD:", payload)
             try:
@@ -1347,7 +1356,7 @@ if __name__ == "__main__":
     parser.add_argument('--server-port', type=int, default=9080, help="Port for the API/command HTTP server (dashboard API, SSE, exports, mapping/command endpoints)")
     parser.add_argument('--frontend-port', type=int, default=9081, help="Port for the frontend dashboard HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=10.0, help="Run send_result() every F seconds")
-    parser.add_argument('--aip', type=str, default="192.168.1.4:8001", help="Autopilot host/IP to POST target payloads to")
+    parser.add_argument('--aip', type=str, default="192.168.1.3:8001", help="Autopilot host/IP to POST target payloads to")
     parser.add_argument('--map-idle-timeout', type=float, default=IDLE_MAPPING_TIMEOUT_SECONDS,
                         help="Seconds of ingest idle time before mapping auto-triggers (0 to disable)")
     parser.add_argument('--mapping-only', action='store_true',

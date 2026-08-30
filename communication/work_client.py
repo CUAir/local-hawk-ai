@@ -286,6 +286,27 @@ class WorkClient(object):
 
         return response
 
+    def clear_gs(self) -> requests.Response:
+        """POST /util/clear_mdlc on the ground server — truncates the image/target/
+        telemetry/assignment tables and wipes its images/ directory on disk. Unlike
+        clear_cloud(), gs-backend's endpoint has no auth header requirement."""
+        url = self.gs_url + "util/clear_mdlc"
+        logger.info("Clearing ground server state — url=%s", url)
+        try:
+            response = self._do_request_with_retries(
+                'post', url, timeout=self.http_timeout_seconds,
+            )
+        except Exception as e:
+            print_red(f"[work_client] Failed to clear ground server after retries: {e}")
+            raise
+
+        if 200 <= response.status_code < 300:
+            print(f"[work_client] Ground server cleared (status={response.status_code})")
+        else:
+            print_red(f"[work_client] Ground server clear failed (status={response.status_code})")
+
+        return response
+
     def get_cloud_mapping_status(self) -> typing.Optional[dict]:
         """GET /api/mapping/status on the cloud server.
 
