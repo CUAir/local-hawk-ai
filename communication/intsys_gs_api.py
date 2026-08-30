@@ -15,6 +15,8 @@ from PIL import Image
 import time
 import json
 from pathlib import Path
+from constructs.geotagging import geotag_candidate
+from constructs.image_types import GeoLocation, ImageMeta, Base64Image, CandidateImage, LabelTypes
 
 # Directory to save exported images pushed by cloud
 EXPORT_DIR = Path(__file__).parent.parent / "exports"
@@ -509,6 +511,44 @@ class MapCommandHandler(BaseHTTPRequestHandler):
 
             # API: latest best metadata for both labels
             if path == '/api/best':
+                def compute_target_location(m: dict) -> dict:
+                    """Compute geotagged target lat/lon from meta and add to dict."""
+                    try:
+                        bbox = m.get('bbox')
+                        full_image_name = m.get('full_image')
+                        assignment = m.get('assignment') or {}
+                        if not bbox or len(bbox) != 4 or not full_image_name:
+                            return m
+                        full_path = EXPORT_DIR / full_image_name
+                        if not full_path.exists():
+                            return m
+                        # Extract telemetry from assignment
+                        img_data = assignment.get('image') or {}
+                        tel = img_data.get('telemetry') or {}
+                        gps = tel.get('gps') or {}
+                        lat = gps.get('latitude')
+                        lon = gps.get('longitude')
+                        alt = tel.get('altitude')
+                        heading = tel.get('planeYaw') or tel.get('yaw') or 0.0
+                        if lat is None or lon is None or alt is None:
+                            return m
+                        # Build candidate for geotagging
+                        with open(full_path, 'rb') as img_f:
+                            b64 = base64.b64encode(img_f.read()).decode('utf-8')
+                        meta = ImageMeta(
+                            location=GeoLocation(lat=float(lat), lon=float(lon), alt=float(alt)),
+                            heading=float(heading)
+                        )
+                        source = Base64Image(id=0, base64_image=b64, meta=meta)
+                        candidate = CandidateImage(bbox=bbox, score=0, source=source, label=LabelTypes.UNKNOWN)
+                        geo = geotag_candidate(candidate)
+                        if geo:
+                            m['target_lat'] = geo.lat
+                            m['target_lon'] = geo.lon
+                    except Exception:
+                        pass
+                    return m
+
                 def load_meta_list(label_name: str, limit: int = 200):
                     metas = []
                     for mf in EXPORT_DIR.glob(f'meta_{label_name}_*.json'):
@@ -517,6 +557,8 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                 m = _json.load(f)
                             # attach source meta filename for frontend identification
                             m['_meta_filename'] = mf.name
+                            # compute target geolocation
+                            m = compute_target_location(m)
                             metas.append(m)
                         except Exception:
                             continue
