@@ -537,7 +537,7 @@ async function fetchBest() {
     }
 
     // Target geolocation (computed by geotagging)
-    if (data.target_lat !== undefined && data.target_lon !== undefined) {
+    if (typeof data.target_lat === 'number' && typeof data.target_lon === 'number') {
       html += '<div class="loc-grid" style="margin-top:8px; border-left: 2px solid var(--accent);">' +
               '<div><span class="k">TARGET LAT</span><span class="v">' + data.target_lat.toFixed(6) + '</span></div>' +
               '<div><span class="k">TARGET LON</span><span class="v">' + data.target_lon.toFixed(6) + '</span></div>' +
