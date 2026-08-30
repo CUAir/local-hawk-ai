@@ -35,6 +35,40 @@ header = print_green
 logger = logging.getLogger(__name__)
 
 
+def _compute_target_geolocation(assignment: dict, bbox: list, image_path) -> tuple:
+    """Compute geotagged target lat/lon from assignment telemetry and bbox.
+
+    Returns (target_lat, target_lon) or (None, None) if computation fails.
+    """
+    try:
+        if not bbox or len(bbox) != 4:
+            return None, None
+        img_data = (assignment or {}).get('image') or {}
+        tel = img_data.get('telemetry') or {}
+        gps = tel.get('gps') or {}
+        lat = gps.get('latitude')
+        lon = gps.get('longitude')
+        alt = tel.get('altitude')
+        heading = tel.get('planeYaw') or tel.get('yaw') or 0.0
+        if lat is None or lon is None or alt is None:
+            return None, None
+        # Load image and compute geotag
+        with open(image_path, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode('utf-8')
+        meta = ImageMeta(
+            location=GeoLocation(lat=float(lat), lon=float(lon), alt=float(alt)),
+            heading=float(heading)
+        )
+        source = Base64Image(id=0, base64_image=b64, meta=meta)
+        candidate = CandidateImage(bbox=bbox, score=0, source=source, label=LabelTypes.UNKNOWN)
+        geo = geotag_candidate(candidate)
+        if geo:
+            return geo.lat, geo.lon
+    except Exception as e:
+        logger.debug(f"Geotag computation failed: {e}")
+    return None, None
+
+
 def _ensure_export_dir() -> bool:
     """Ensure EXPORT_DIR exists, even if deleted mid-runtime."""
     try:
@@ -638,6 +672,8 @@ class VisionClient:
                     except Exception:
                         pass
                     session_start_ts, since_session_start_ms = self._since_session_start(ts)
+                    bbox = list(roi.top_left) + list(roi.bottom_right)
+                    target_lat, target_lon = _compute_target_geolocation(assign, bbox, full_fn)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
@@ -648,10 +684,12 @@ class VisionClient:
                         "score": float(clf.label[1]) if clf is not None else 0.0,
                         "full_image": str(full_fn.name),
                         "roi_image": str(roi_fn.name),
-                        "bbox": list(roi.top_left) + list(roi.bottom_right),
+                        "bbox": bbox,
                         "pushed": True,
                         "session_start_ts": session_start_ts,
                         "since_session_start_ms": since_session_start_ms,
+                        "target_lat": target_lat,
+                        "target_lon": target_lon,
                     }
                     try:
                         import os as _os
@@ -751,6 +789,8 @@ class VisionClient:
                             meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                             tmp_meta = str(meta_fn) + '.tmp'
                             session_start_ts, since_session_start_ms = self._since_session_start(ts)
+                            bbox = list(roi.top_left) + list(roi.bottom_right)
+                            target_lat, target_lon = _compute_target_geolocation(assign, bbox, full_fn)
                             with open(tmp_meta, 'w') as _mf:
                                 json.dump({
                                     "timestamp": ts,
@@ -762,10 +802,12 @@ class VisionClient:
                                     "score": float(clf.label[1]) if clf is not None else 0.0,
                                     "full_image": str(full_fn.name),
                                     "roi_image": str(roi_fn.name),
-                                    "bbox": list(roi.top_left) + list(roi.bottom_right),
+                                    "bbox": bbox,
                                     "pushed": True,
                                     "session_start_ts": session_start_ts,
                                     "since_session_start_ms": since_session_start_ms,
+                                    "target_lat": target_lat,
+                                    "target_lon": target_lon,
                                 }, _mf)
                                 _mf.flush()
                                 _os.fsync(_mf.fileno())
@@ -984,6 +1026,8 @@ class VisionClient:
                 # Write metadata sidecar JSON
                 try:
                     session_start_ts, since_session_start_ms = self._since_session_start(ts)
+                    bbox = list(roi.top_left) + list(roi.bottom_right)
+                    target_lat, target_lon = _compute_target_geolocation(self.assignment, bbox, full_fn)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
@@ -994,11 +1038,12 @@ class VisionClient:
                         "score": float(best_mannequin.score),
                         "full_image": str(full_fn.name),
                         "roi_image": str(roi_fn.name),
-                        "bbox": list(roi.top_left) + list(roi.bottom_right),
-                            # Mark that this is a GD backup candidate (not a cloud push)
-                            "pushed": False,
-                            "session_start_ts": session_start_ts,
-                            "since_session_start_ms": since_session_start_ms,
+                        "bbox": bbox,
+                        "pushed": False,
+                        "session_start_ts": session_start_ts,
+                        "since_session_start_ms": since_session_start_ms,
+                        "target_lat": target_lat,
+                        "target_lon": target_lon,
                     }
                     meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                     with open(meta_fn, "w") as mf:
@@ -1041,21 +1086,24 @@ class VisionClient:
                     pass
                 try:
                     session_start_ts, since_session_start_ms = self._since_session_start(ts)
+                    bbox = list(roi.top_left) + list(roi.bottom_right)
+                    target_lat, target_lon = _compute_target_geolocation(self.assignment, bbox, full_fn)
                     meta = {
                         "timestamp": ts,
                         "label": label_name,
                         "assignment_id": aid,
-                            "assignment": self.assignment,
+                        "assignment": self.assignment,
                         "model_source": "gd_backup",
                         "gemini_reason": None,
                         "score": float(best_tent.score),
                         "full_image": str(full_fn.name),
                         "roi_image": str(roi_fn.name),
-                        "bbox": list(roi.top_left) + list(roi.bottom_right),
-                        # Mark that this is a GD backup candidate (not a cloud push)
+                        "bbox": bbox,
                         "pushed": False,
                         "session_start_ts": session_start_ts,
                         "since_session_start_ms": since_session_start_ms,
+                        "target_lat": target_lat,
+                        "target_lon": target_lon,
                     }
                     meta_fn = EXPORT_DIR / f"meta_{label_name}_{aid}_{ts}.json"
                     with open(meta_fn, "w") as mf:

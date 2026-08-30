@@ -178,9 +178,16 @@ class WorkClient(object):
 
         """
         while True:
-            response = requests.post(
-                self.gs_url + self.work_endp, headers=self.auth_headers
-            )
+            try:
+                response = requests.post(
+                    self.gs_url + self.work_endp,
+                    headers=self.auth_headers,
+                    timeout=self.http_timeout_seconds,
+                )
+            except requests.RequestException as e:
+                print_red(f"[work_client] Work request failed: {e}")
+                time.sleep(2)
+                continue
             status_code = response.status_code
             print(f"[work_client] Polled work endpoint: {self.gs_url + self.work_endp} (status={status_code})")
             if status_code == 204:  # successful request, no content

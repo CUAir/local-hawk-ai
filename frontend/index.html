@@ -536,18 +536,27 @@ async function fetchBest() {
       html += '<div class="gemini-reason">' + (data.gemini_reason || 'N/A') + '</div>';
     }
 
+    // Target geolocation (computed by geotagging)
+    if (data.target_lat !== undefined && data.target_lon !== undefined) {
+      html += '<div class="loc-grid" style="margin-top:8px; border-left: 2px solid var(--accent);">' +
+              '<div><span class="k">TARGET LAT</span><span class="v">' + data.target_lat.toFixed(6) + '</span></div>' +
+              '<div><span class="k">TARGET LON</span><span class="v">' + data.target_lon.toFixed(6) + '</span></div>' +
+              '</div>';
+    }
+
     // Assignment / location details (if available)
     try {
       const a = data.assignment || null;
       if (a) {
         if (a.telemetry) {
           const t = a.telemetry;
-          html += '<div class="loc-grid">' +
-                  '<div><span class="k">LAT</span><span class="v">' + (t.latitude !== undefined ? t.latitude : 'N/A') + '</span></div>' +
-                  '<div><span class="k">LON</span><span class="v">' + (t.longitude !== undefined ? t.longitude : 'N/A') + '</span></div>' +
+          html += '<details class="assignment"><summary>Drone telemetry</summary>' +
+                  '<div class="loc-grid">' +
+                  '<div><span class="k">DRONE LAT</span><span class="v">' + (t.latitude !== undefined ? t.latitude : 'N/A') + '</span></div>' +
+                  '<div><span class="k">DRONE LON</span><span class="v">' + (t.longitude !== undefined ? t.longitude : 'N/A') + '</span></div>' +
                   '<div><span class="k">ALT</span><span class="v">' + (t.altitude !== undefined ? t.altitude : 'N/A') + '</span></div>' +
                   '<div><span class="k">YAW</span><span class="v">' + (t.yaw !== undefined ? t.yaw : 'N/A') + '</span></div>' +
-                  '</div>';
+                  '</div></details>';
         } else {
           html += '<details class="assignment"><summary>Raw assignment</summary><pre>' + JSON.stringify(a, null, 2) + '</pre></details>';
         }
