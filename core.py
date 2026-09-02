@@ -6,6 +6,7 @@ from vision.classifiers.abstract_classifier import AbstractClassifier
 from constructs.classification import Classification, LabelType
 from constructs.roi import ROI
 import argparse
+import math
 import PIL.Image as Image
 from multiprocessing import Process
 import socket
@@ -33,6 +34,52 @@ from constructs.geotagging import geotag_candidate
 header = print_green
 
 logger = logging.getLogger(__name__)
+
+
+# --- Autopilot send: ground-test altitude fallback ---------------------------
+# geotag_candidate() returns None when location.alt <= 0 (constructs/geotagging.py),
+# because the nadir projection scales ground offset linearly with altitude: at 0 m
+# every pixel in the frame collapses onto the aircraft's own position. Meanwhile
+# mini-plane-system reports MAVLink relative_alt (pixhawk/pixhawk.py), which sits at
+# ~0 on the bench, so the manual "Send to Autopilot" button could never fire on the
+# ground.
+#
+# When the reported AGL is non-positive we substitute a nominal altitude so the send
+# still goes through. The resulting lat/lon is a TEST coordinate, not a real fix --
+# its offset from the aircraft is fabricated from this constant. Set
+# HAWKAI_FALLBACK_ALT_M=0 to restore the strict on-ground refusal.
+DEFAULT_FALLBACK_AGL_M = 30.0
+
+
+def _fallback_agl_m() -> float:
+    """Configured stand-in AGL in metres, or 0.0 when the fallback is disabled."""
+    try:
+        value = float(os.environ.get("HAWKAI_FALLBACK_ALT_M", DEFAULT_FALLBACK_AGL_M))
+    except (TypeError, ValueError):
+        return DEFAULT_FALLBACK_AGL_M
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _resolve_agl(alt_raw):
+    """Return (altitude_m, substituted) for the autopilot projection.
+
+    `substituted` is True when the telemetry altitude was unusable (non-positive,
+    missing or non-finite) and the fallback stood in for it. When the fallback is
+    disabled the unusable value is passed through so geotag_candidate() still
+    refuses the projection.
+    """
+    try:
+        alt = float(alt_raw)
+    except (TypeError, ValueError):
+        alt = 0.0
+    if not math.isfinite(alt):
+        alt = 0.0
+    if alt > 0.0:
+        return alt, False
+    fallback = _fallback_agl_m()
+    if fallback <= 0.0:
+        return alt, False
+    return fallback, True
 
 
 def _compute_target_geolocation(assignment: dict, bbox: list, image_path) -> tuple:
@@ -402,8 +449,13 @@ class VisionClient:
 
             # loop repeats after interval
 
-    def _build_candidate_from_entry(self, assignment: dict, roi: ROI, classification: Classification, meta_filename: str = None, base64_override: str = None) -> CandidateImage:
-        """Construct a CandidateImage (with Base64Image.source.meta) suitable for geotag_candidate()."""
+    def _build_candidate_from_entry(self, assignment: dict, roi: ROI, classification: Classification, meta_filename: str = None, base64_override: str = None):
+        """Build a CandidateImage suitable for geotag_candidate().
+
+        Returns (candidate, alt_substituted), where alt_substituted is True when the
+        assignment's telemetry altitude was unusable and _resolve_agl() supplied a
+        stand-in so an on-ground manual send can still be projected.
+        """
         # Try to get base64 full image from meta file
         b64 = None
         try:
@@ -443,6 +495,7 @@ class VisionClient:
 
         # Build ImageMeta from assignment telemetry (best-effort)
         meta = None
+        alt_substituted = False
         try:
             lat = None; lon = None; alt = None; heading = 0.0
             if assignment and isinstance(assignment, dict):
@@ -454,9 +507,11 @@ class VisionClient:
                 alt = tel.get('altitude') or gps.get('altitude') or tel.get('alt')
                 heading = tel.get('yaw') or tel.get('planeYaw') or 0.0
             if lat is not None and lon is not None:
-                meta = ImageMeta(location=GeoLocation(lat=float(lat), lon=float(lon), alt=float(alt or 0.0)), heading=float(heading))
+                agl, alt_substituted = _resolve_agl(alt)
+                meta = ImageMeta(location=GeoLocation(lat=float(lat), lon=float(lon), alt=agl), heading=float(heading))
         except Exception:
             meta = None
+            alt_substituted = False
 
         base_src = Base64Image(id=assignment.get('id') if isinstance(assignment, dict) else 0, base64_image=b64 or '', meta=meta, assignment=assignment)
         bbox = []
@@ -471,7 +526,7 @@ class VisionClient:
         except Exception:
             score = 0.0
         cand = CandidateImage(bbox=bbox, score=score, source=base_src, label=LabelTypes.UNKNOWN)
-        return cand
+        return cand, alt_substituted
 
     def send_entry_to_autopilot(self, entry, target_type_str: str) -> dict:
         """Build a candidate from `entry`, project it, and POST it to the autopilot endpoint.
@@ -497,11 +552,19 @@ class VisionClient:
             meta_fn = entry[5] if len(entry) > 5 else None
 
             cand = None
+            alt_substituted = False
             try:
-                cand = self._build_candidate_from_entry(assignment, roi, classification, meta_filename=meta_fn)
+                cand, alt_substituted = self._build_candidate_from_entry(assignment, roi, classification, meta_filename=meta_fn)
             except Exception as e:
                 print_red(f"[autopilot] Failed to build candidate for projection: {e}")
                 cand = None
+
+            if alt_substituted:
+                print_yellow(
+                    f"[autopilot] Telemetry AGL was <= 0 (aircraft on the ground?); "
+                    f"projecting with a {_fallback_agl_m():.1f} m fallback - the "
+                    f"coordinate below is for testing, not a real target fix"
+                )
 
             lat = None; lon = None
             if cand is not None:
@@ -543,7 +606,8 @@ class VisionClient:
             if resp is not None and 200 <= resp.status_code < 300:
                 print(f"[autopilot] Sent {target_type_str} -> {self.autopilot_url} (id={self._autopilot_id}, status={resp.status_code})")
                 self._autopilot_id += 1
-                return {"status": "success", "message": f"Sent {target_type_str} to autopilot (lat={lat:.6f}, lon={lon:.6f})"}
+                note = " [TEST ALT]" if alt_substituted else ""
+                return {"status": "success", "message": f"Sent {target_type_str} to autopilot (lat={lat:.6f}, lon={lon:.6f}){note}"}
             else:
                 status = resp.status_code if resp is not None else "no response"
                 msg = f"Autopilot rejected payload (status={status})"
