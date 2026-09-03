@@ -26,6 +26,7 @@ from utils.helper import print_green, print_red, print_yellow
 import time
 import threading
 import logging
+from dataclasses import asdict
 from constructs.image_types import Base64Image, LabelTypes, ImageMeta, GeoLocation, CandidateImage
 from constructs.geotagging import geotag_candidate
 
@@ -80,6 +81,30 @@ def _resolve_agl(alt_raw):
     if fallback <= 0.0:
         return alt, False
     return fallback, True
+
+
+def _telemetry_fields(tel: dict) -> tuple:
+    """Extract (lat, lon, alt, heading) from a gs-backend telemetry block.
+
+    gs-backend nests GPS under "gps" and names the heading "planeYaw". Readers
+    that assumed flat "latitude"/"longitude"/"yaw" keys silently got nothing for
+    every image, so this is the single definition of where those values live.
+    Used by _build_image_meta() (the cloud-upload meta) -- _compute_target_geolocation
+    below keeps its own inline extraction as-is rather than being rewired to share
+    this, to avoid touching a function the currently-pulled codebase already owns.
+
+    Returns (None, None, None, None) when lat/lon are absent.
+    """
+    tel = tel or {}
+    gps = tel.get('gps') or {}
+    lat = gps.get('latitude')
+    lon = gps.get('longitude')
+    if lat is None or lon is None:
+        return None, None, None, None
+    heading = tel.get('planeYaw')
+    if heading is None:
+        heading = tel.get('yaw')
+    return lat, lon, tel.get('altitude'), (heading if heading is not None else 0.0)
 
 
 def _compute_target_geolocation(assignment: dict, bbox: list, image_path) -> tuple:
@@ -177,6 +202,11 @@ def _get_gd_model():
             return None
 
 MAX_BOX_FRACTION = 0.5
+
+# Stand down the local GroundingDINO pass once the cloud has produced a result
+# for BOTH labels within this many seconds - it's genuinely redundant at that
+# point, and GD's single detection pass can't selectively skip just one label.
+GD_SKIP_IF_CLOUD_FRESH_S = 120.0
 
 # Mapping pipeline constants (mirrors hawk-ai/main.py)
 MAPPING_SESSION_DIR = Path(__file__).parent / "mapping" / "current_session"
@@ -387,7 +417,7 @@ class Mapper:
         self.trigger_pipeline()
 
 class VisionClient:
-    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
+    def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0, classify_every_n: int = 1):
         header("\n[vision] Initializing Work Client")
         self.work_client = work_client
         # print("Getting target attributes")
@@ -406,6 +436,15 @@ class VisionClient:
         self._autopilot_id = 0
 
         self.result_interval_seconds = max(1.0, float(result_interval_seconds))
+
+        # Classification gate: every image is still pulled, exported and handed to
+        # mapping, but only every Nth is run through GroundingDINO and uploaded to
+        # the cloud. A count, not a duration - the assignment's image.timestamp is
+        # unreliable (real exports carry 1970 dates), and a wall-clock gate would
+        # give unpredictable ground spacing while the loop drains a backlog.
+        self.classify_every_n = max(1, int(classify_every_n))
+        self._cycle_count = 0
+
         self._send_lock = threading.Lock()
         # Single background thread: poll cloud for results, then send to autopilot
         self._result_scheduler_thread = threading.Thread(
@@ -596,10 +635,16 @@ class VisionClient:
             }
             print("PAYLOAD:", payload)
             try:
-                # Use WorkClient's retry helper for autopilot POSTs to benefit from same retry/backoff logic
-                resp = self.work_client._do_request_with_retries('post', self.autopilot_url, json=payload, timeout=5)
+                # PIPELINE_AUDIT.md F34: a retrying wrapper here can double-send a
+                # target if the first response was merely lost, not un-sent -
+                # the same zero-retry rule the capture-upload path already
+                # correctly follows for non-idempotent sends. This also drops
+                # the up-to-11s _send_lock hold the retry loop caused; a lost
+                # send just means the operator (this is a manual, button-
+                # triggered send) clicks again.
+                resp = requests.post(self.autopilot_url, json=payload, timeout=5)
             except Exception as e:
-                msg = f"Failed to POST to autopilot after retries: {e}"
+                msg = f"Failed to POST to autopilot: {e}"
                 print_red(f"[autopilot] {msg}")
                 return {"status": "error", "message": msg}
 
@@ -914,15 +959,17 @@ class VisionClient:
 
     def run_task(self):
         print("\n[worker] Starting task cycle ========")
-        
+
         print_green("[worker] Requesting image from imaging GS")
         self.request_image()
-        time.sleep(1)
-        print_green("[worker] Uploading image + running backup detection")
+
+        # Cloud upload always runs, every image - it's the source of truth and
+        # the target can move in/out of frame. Local GD's redundant pass is
+        # gated inside run_model() itself (classify_every_n + cloud freshness).
+        print_green("[worker] Uploading image to cloud")
         self.run_model()
 
         print("[worker] Task cycle complete ========\n")
-        time.sleep(1) # sleep 1 second, blocking
 
 
     
@@ -931,13 +978,29 @@ class VisionClient:
     def request_image(self):
         self.assignment = None
         self.image = None
+        self.metadata = None
         while True:
             self.assignment, metadata = self.work_client.get_image_assignment()
             if self.assignment == None:
                 continue
             image = self.work_client.get_image(metadata["endpoint"])
             break
+        if image is None:
+            # PIPELINE_AUDIT.md F11: the code below still writes a meta_gs_*
+            # record and fires the gs_pull SSE for this assignment even
+            # though there is no image -- that behavior is unchanged here,
+            # this just makes the failure visible instead of a silent
+            # phantom "last image" update on the dashboard.
+            logger.error(
+                "get_image() returned None for assignment id=%s endpoint=%s — "
+                "export/meta for this pull will reference a missing image.",
+                metadata.get('id'), metadata.get('endpoint'),
+            )
         self.image = image
+        # Held on the instance so run_model()/send_image() can attach GPS to the
+        # cloud upload - it used to be a local here, which is why every image
+        # reached hawk-ai with meta=None and its mapping session stayed empty.
+        self.metadata = metadata
         logger.info("Image received from GS — id=%s endpoint=%s", metadata.get('id'), metadata.get('endpoint'))
         self.mapper.mark_image_received()
 
@@ -962,8 +1025,8 @@ class VisionClient:
             full_fn = EXPORT_DIR / f"full_gs_{aid}_{ts}.jpg"
             try:
                 self.image.save(str(full_fn), format="JPEG")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to write %s (image=%r): %s", full_fn, self.image, e)
 
             # Minimal metadata: timestamp and assignment only (no processing fields)
             try:
@@ -996,11 +1059,44 @@ class VisionClient:
         # Save to hawk-ai-style mapping session (side effect, does not affect detection flow)
         _save_image_for_mapping_local(image, metadata)
 
+    def _build_image_meta(self) -> dict:
+        """Build the `meta` block for the cloud upload from assignment telemetry.
+
+        Returns None when the assignment carried no GPS, which is the only case
+        the cloud is entitled to skip for mapping. Built here rather than in
+        WorkClient because core imports work_client, not the other way round,
+        and `_telemetry_fields` is the single reader for this shape.
+        """
+        lat, lon, alt, heading = _telemetry_fields((self.metadata or {}).get("telemetry"))
+        if lat is None or lon is None:
+            return None
+        return asdict(ImageMeta(
+            location=GeoLocation(lat=float(lat), lon=float(lon), alt=float(alt or 0.0)),
+            heading=float(heading),
+            has_real_geo=True,
+        ))
+
     # Perform autonomous detection and classification
     def run_model(self):
-        self.gd_backup()
+        # Local GD is a fallback for when the cloud is down or slow, so it stands
+        # down once the cloud is confirmed actively producing results for both
+        # labels - classify_every_n still caps how often it's even considered,
+        # so it doesn't peg Pi CPU/GPU every single tick before the cloud has
+        # anything either.
+        self._cycle_count += 1
+        due_for_local_gd = (self._cycle_count % self.classify_every_n == 0)
+        if due_for_local_gd:
+            if self.result_store.both_cloud_fresh(GD_SKIP_IF_CLOUD_FRESH_S):
+                print_yellow(
+                    f"[worker] Skipping local GD - cloud has results for both labels "
+                    f"within the last {GD_SKIP_IF_CLOUD_FRESH_S:.0f}s"
+                )
+            else:
+                print_green("[worker] Running local backup detection")
+                self.gd_backup()
         try:
-            response = self.work_client.send_image(self.image, self.assignment)
+            response = self.work_client.send_image(self.image, self.assignment,
+                                                   meta=self._build_image_meta())
             if 200 <= response.status_code < 300:
                 print(f"[cloud] Image upload accepted (status={response.status_code})")
             else:
@@ -1231,9 +1327,9 @@ def start_frontend_server(port: int, server_port: int):
     except Exception as e:
         print_red(f"Error in frontend HTTP server: {e}")
 
-def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
+def worker_loop(work_client: WorkClient, mapper: Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0, classify_every_n: int = 1):
     header("\n[worker] Starting worker loop")
-    worker = VisionClient(work_client, mapper, result_store, autopilot_host, result_interval_seconds)
+    worker = VisionClient(work_client, mapper, result_store, autopilot_host, result_interval_seconds, classify_every_n)
     MapCommandHandler.vision_client = worker
     while True:
         try:
@@ -1326,6 +1422,7 @@ def main(
     enable_map_idle_trigger: bool = False,
     mps_address: str = None,
     gs_backend_log: str = None,
+    classify_every_n: int = 1,
 ):
     log_path = _setup_file_logging()
     logger.info("Local Hawk-AI client started — gs=%s cs=%s log=%s", gs_ip_address, cs_ip_address, log_path)
@@ -1392,7 +1489,16 @@ def main(
         print_yellow("[startup] Mapping-only mode enabled: worker loop disabled")
         while True:
             time.sleep(60)
-    worker_loop(work_client, mapper, result_store, autopilot_host, result_interval_seconds)
+
+    # PIPELINE_AUDIT.md F15: _get_gd_model() otherwise loads lazily on the
+    # first classify cycle, putting a cold GroundingDINO load on the critical
+    # path of an early image. Warmed in the background so it doesn't block
+    # the dashboard/API server from becoming available. Skipped above in
+    # mapping_only mode, matching _get_gd_model()'s own reason for being lazy
+    # in the first place - gd_backup() is never called there.
+    threading.Thread(target=_get_gd_model, daemon=True, name="gd-model-warmup").start()
+
+    worker_loop(work_client, mapper, result_store, autopilot_host, result_interval_seconds, classify_every_n)
     # Create processes
     # mapper_process = Process(target=start_mapping_server, args=(mapper, map_server_port))
     # worker_process1 = Process(target=worker_loop, args=(work_client, mapper))
@@ -1434,6 +1540,13 @@ if __name__ == "__main__":
                         default=str(Path(__file__).resolve().parent.parent / 'gs-backend' / 'logs' / 'server.log'),
                         help="Path to gs-backend's logs/server.log for the log panel "
                              "(default: sibling gs-backend checkout)")
+    parser.add_argument('--classify-every-n', type=int, default=1,
+                        help="Run local GroundingDINO on only every Nth image (gated further by "
+                             "cloud freshness - see both_cloud_fresh). Every image is still pulled, "
+                             "exported and fed to mapping, and every image is still uploaded to the "
+                             "cloud regardless of this gate. A COUNT, not a duration: with MPS "
+                             "capturing every 2s, the default of 2 means local GD runs at most once "
+                             "per 4s. Use 1 to allow it every image.")
 
     args = parser.parse_args()
 
@@ -1458,4 +1571,5 @@ if __name__ == "__main__":
         args.enable_map_idle_trigger,
         args.mps,
         args.gs_backend_log,
+        args.classify_every_n,
     )

@@ -299,6 +299,23 @@
     }
     .logpanel-out.empty-state { color: var(--muted); white-space: pre-wrap; }
 
+    /* --- No-detection panel -------------------------------------------- */
+    /* Same collapsed-<details> pattern as .logpanel above, placed after </main>
+       for the same reason: a 4th <section> inside .board's 3-column grid
+       wraps to a second row instead of becoming a column. */
+    .nodetect-panel { padding: 0 20px 28px; }
+    .nodetect-panel > details {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    }
+    .nodetect-panel > details > summary {
+      cursor: pointer; padding: 10px 14px; font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 10px; list-style: none;
+    }
+    .nodetect-panel > details > summary::-webkit-details-marker { display: none; }
+    .nodetect-panel > details > summary::before { content: '▸'; color: var(--muted); font-size: 11px; }
+    .nodetect-panel > details[open] > summary::before { content: '▾'; }
+    #log-nodetect { max-height: 50vh; overflow-y: auto; padding: 10px 14px 14px; }
+
     @media (max-width: 720px) {
       .topbar { padding: 12px 14px; }
       .board { padding: 14px; grid-template-columns: 1fr; }
@@ -378,6 +395,16 @@
       <div id="best-panel"><div class="skeleton">Loading…</div></div>
     </section>
   </main>
+
+  <section class="nodetect-panel" aria-label="No detection">
+    <details id="nodetect-details">
+      <summary>
+        <span>Nothing Detected</span>
+        <span class="count-badge" id="count-nodetect">0</span>
+      </summary>
+      <div class="log" id="log-nodetect"></div>
+    </details>
+  </section>
 
   <section class="logpanel" aria-label="Service logs">
     <details id="logpanel-details">
@@ -807,6 +834,30 @@ async function fetchBest() {
     }
     renderCardList(bestPanel, bestDesired, 'No best images yet');
     updateCount('best', bestDesired.length);
+
+    // PIPELINE_AUDIT.md F21: raw pulls with no detection never appear in
+    // tentList/manList (both only ever contain meta_tent_*/meta_mannequin_*
+    // files, i.e. genuine detections), so they were only ever visible as a
+    // timestamp bump. Every entry in best.gs is a raw pull; the ones whose
+    // assignment_id doesn't show up in either detection list had nothing
+    // found in them.
+    const detectedIds = new Set();
+    for (const e of tentList) if (e.assignment_id != null) detectedIds.add(String(e.assignment_id));
+    for (const e of manList) if (e.assignment_id != null) detectedIds.add(String(e.assignment_id));
+    const gsList = best.gs || [];
+    const nothingDetected = gsList.filter(e => e.assignment_id == null || !detectedIds.has(String(e.assignment_id)));
+    const nodetectLog = document.getElementById('log-nodetect');
+    if (nodetectLog) {
+      const desired = nothingDetected.map(e => ({
+        key: cardKey('nodetect', e._meta_filename || null, e),
+        label: 'nodetect',
+        data: e,
+        metaFilename: null, // no bbox/target on a raw pull - nothing to send to autopilot
+        isBest: false,
+      }));
+      renderCardList(nodetectLog, desired, 'Nothing pending');
+      updateCount('nodetect', desired.length);
+    }
   }
 
   // Admin actions: clear cloud server / delete local saved images

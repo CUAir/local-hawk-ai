@@ -7,6 +7,7 @@ import io
 import base64
 import hashlib
 import threading
+import socket
 import requests
 from utils.helper import print_green, print_red, print_yellow
 from constructs.roi import ROI
@@ -51,6 +52,53 @@ def ensure_export_dir() -> bool:
 # Simple Server-Sent Events (SSE) support for notifying frontend of new GS pulls
 SSE_CLIENTS = []
 SSE_LOCK = threading.Lock()
+
+# PIPELINE_AUDIT.md F22/F35: /api/best re-read, re-decoded, and re-base64-encoded
+# every listed image from disk on every single poll (10s, plus every SSE-triggered
+# refresh), with no cache at all, and its missing-file fallback fetched from gs-backend
+# synchronously inside the HTTP handler on every poll too if the file stayed missing.
+_B64_CACHE_LOCK = threading.Lock()
+_B64_CACHE: dict = {}          # path (str) -> (mtime, b64_data_url)
+_FETCH_FAIL_UNTIL: dict = {}   # path (str) -> time.time() before which we skip retrying
+_FETCH_RETRY_COOLDOWN_S = 30.0
+
+
+def _cached_data_url_for_file(path) -> "str | None":
+    """Return a cached `data:image/jpeg;base64,...` URL for `path`, re-reading
+    only when the file's mtime has changed since the last read. `path` may not
+    exist, in which case this returns None without touching the cache."""
+    key = str(path)
+    try:
+        mtime = os.path.getmtime(key)
+    except OSError:
+        return None
+    with _B64_CACHE_LOCK:
+        cached = _B64_CACHE.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    try:
+        with open(key, 'rb') as f:
+            data_url = 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode('utf-8')
+    except OSError:
+        return None
+    with _B64_CACHE_LOCK:
+        _B64_CACHE[key] = (mtime, data_url)
+    return data_url
+
+
+def _should_attempt_fetch(path) -> bool:
+    """False if a fetch for this path failed recently enough that we should
+    hold off retrying it on every single poll."""
+    key = str(path)
+    with _B64_CACHE_LOCK:
+        until = _FETCH_FAIL_UNTIL.get(key)
+        return until is None or time.time() >= until
+
+
+def _record_fetch_failure(path) -> None:
+    key = str(path)
+    with _B64_CACHE_LOCK:
+        _FETCH_FAIL_UNTIL[key] = time.time() + _FETCH_RETRY_COOLDOWN_S
 
 # --- Continuous-capture control (proxied to MPS on the aircraft) -------------
 # Serializes capture commands so two dashboards can't both pass the "is it
@@ -229,10 +277,15 @@ class ResultStore:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # Separate storage for cloud-pulled entries (most-recent wins)
+        # Separate storage for cloud-pulled entries (highest-confidence wins)
         self._cloud: dict = {"tent": None, "mannequin": None}
         # Storage for best GD backups per label (highest-confidence wins)
         self._gd_best: dict = {"tent": None, "mannequin": None}
+        # Wall-clock time of the most recent cloud update per label, regardless
+        # of whether it replaced the displayed entry. Lets callers ask "is the
+        # cloud actively producing results for this label right now" (used to
+        # stand down the redundant local GD pass once it is).
+        self._cloud_updated_at: dict = {"tent": None, "mannequin": None}
 
     def update(self, label: LabelType, assignment: dict, roi: ROI, classification: Classification, model_source: str = "", gemini_reason: str = "", meta_filename: str = None):
        """Update the store.
@@ -259,14 +312,30 @@ class ResultStore:
                 print_yellow(f"[result_store] Received unknown label: {label}")
                 return
 
-            # Cloud entries win unconditionally (most-recent cloud_pull overrides anything)
+            # Cloud entries: kept only if confidence is >= the current cloud best for
+            # this label (>= rather than > so an equally-confident, more-recent
+            # sighting still refreshes the displayed image/timestamp). This used to be
+            # "most-recent cloud_pull overrides anything", which let a low-confidence
+            # detection silently replace a high-confidence one -- contradicting this
+            # method's own "canonical cloud best" framing.
             if model_source and 'cloud' in model_source:
-                self._cloud[lbl] = entry
+                self._cloud_updated_at[lbl] = time.time()
                 try:
                     conf = float(classification.label[1]) if classification is not None else 0.0
                 except Exception:
                     conf = 0.0
-                print(f"[result_store] Updated cloud {lbl} (conf={conf:.3f}, model={model_source})")
+                prev = self._cloud.get(lbl)
+                prev_conf = -1.0
+                if prev is not None and len(prev) >= 3 and prev[2] is not None:
+                    try:
+                        prev_conf = float(prev[2].label[1])
+                    except Exception:
+                        prev_conf = -1.0
+                if prev is None or conf >= prev_conf:
+                    self._cloud[lbl] = entry
+                    print(f"[result_store] Updated cloud {lbl} (conf={conf:.3f}, model={model_source})")
+                else:
+                    print(f"[result_store] Kept existing cloud {lbl} (conf={prev_conf:.3f}) over new {conf:.3f}")
                 return
 
             # GD backup: keep only the highest-confidence GD backup for this label
@@ -291,6 +360,7 @@ class ResultStore:
 
             # Fallback: treat other model sources as cloud entries
             self._cloud[lbl] = entry
+            self._cloud_updated_at[lbl] = time.time()
             print(f"[result_store] Updated cloud-like {lbl} (model={model_source})")
 
     def get_mannequin(self):
@@ -301,6 +371,22 @@ class ResultStore:
     def get_tent(self):
         with self._lock:
             return self._cloud.get('tent') or self._gd_best.get('tent')
+
+    def both_cloud_fresh(self, max_age_s: float) -> bool:
+        """True when both labels have a cloud result newer than max_age_s.
+
+        Used to stand down the redundant local GroundingDINO pass once the
+        cloud is confirmed actively producing results for everything it could
+        find in a frame - GD's single detection pass can't selectively skip
+        just one label, so this is necessarily an all-or-nothing gate.
+        """
+        with self._lock:
+            now = time.time()
+            for lbl in ("tent", "mannequin"):
+                ts = self._cloud_updated_at.get(lbl)
+                if ts is None or (now - ts) > max_age_s:
+                    return False
+            return True
 
     def clear(self):
         """Reset all in-memory best results (cloud-pulled and GD backup)."""
@@ -465,15 +551,33 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-cache')
                 self.send_header('Connection', 'keep-alive')
                 self.end_headers()
+                # PIPELINE_AUDIT.md F32/F33: a bounded socket timeout, combined
+                # with periodically attempting a read, is what makes a
+                # disconnect actually observable here. Without it, `sleep(60)`
+                # never raises on peer disconnect, so this cleanup was
+                # unreachable and a wedged client's write inside notify_sse()
+                # could block indefinitely while holding SSE_LOCK.
+                try:
+                    self.connection.settimeout(15)
+                except Exception:
+                    pass
                 with SSE_LOCK:
                     SSE_CLIENTS.append({'wfile': self.wfile})
                 try:
-                    # Keep connection alive; actual writes happen from notify_sse
+                    # EventSource clients never send bytes; a read here exists
+                    # purely to detect disconnect. A timeout just means the
+                    # client is still connected and quiet - keep waiting.
                     while True:
-                        time.sleep(60)
+                        try:
+                            chunk = self.rfile.read(1)
+                        except socket.timeout:
+                            continue
+                        if not chunk:
+                            break  # peer closed the connection
                 except Exception:
+                    pass
+                finally:
                     with SSE_LOCK:
-                        # remove if present
                         for c in list(SSE_CLIENTS):
                             if c.get('wfile') is self.wfile:
                                 try: SSE_CLIENTS.remove(c)
@@ -640,13 +744,15 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     full_path = EXPORT_DIR / full_fname if full_fname else None
                                     roi_path = EXPORT_DIR / roi_fname if roi_fname else None
 
-                                    # If full image file is missing, try to fetch from imaging GS
-                                    if full_fname and (not full_path.exists()):
+                                    # If full image file is missing, try to fetch from imaging GS -
+                                    # but not on every single poll if it just failed (F35).
+                                    if full_fname and (not full_path.exists()) and _should_attempt_fetch(full_path):
                                         try:
                                             assignment = cloud_mannequin.get('assignment') or {}
                                             img_endpoint = None
                                             if isinstance(assignment, dict):
                                                 img_endpoint = (assignment.get('image') or {}).get('imageUrl') or (assignment.get('image') or {}).get('localImageUrl')
+                                            fetched = None
                                             if img_endpoint and hasattr(self, 'mapper') and getattr(self.mapper, 'work_client', None):
                                                 try:
                                                     fetched = self.mapper.work_client.get_image(img_endpoint)
@@ -657,8 +763,10 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                                             pass
                                                 except Exception:
                                                     pass
+                                            if fetched is None:
+                                                _record_fetch_failure(full_path)
                                         except Exception:
-                                            pass
+                                            _record_fetch_failure(full_path)
 
                                     # If roi image file is missing but full is present, create roi crop
                                     if roi_fname and (not roi_path.exists()) and full_fname and (EXPORT_DIR / full_fname).exists():
@@ -679,18 +787,16 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     cloud_mannequin['full_image'] = full_fname if full_fname else None
                                     cloud_mannequin['roi_image'] = roi_fname if roi_fname else None
                                     cloud_mannequin['since_session_start_ms'] = _m.get('since_session_start_ms')
-                                    # Attach base64 image data for frontend convenience
-                                    try:
-                                        if full_fname and (EXPORT_DIR / full_fname).exists():
-                                            with open(EXPORT_DIR / full_fname, 'rb') as _fimg:
-                                                import base64 as _b64
-                                                cloud_mannequin['full_image_b64'] = 'data:image/jpeg;base64,' + _b64.b64encode(_fimg.read()).decode('utf-8')
-                                        if roi_fname and (EXPORT_DIR / roi_fname).exists():
-                                            with open(EXPORT_DIR / roi_fname, 'rb') as _fimg2:
-                                                import base64 as _b642
-                                                cloud_mannequin['roi_image_b64'] = 'data:image/jpeg;base64,' + _b642.b64encode(_fimg2.read()).decode('utf-8')
-                                    except Exception:
-                                        pass
+                                    # Attach base64 image data for frontend convenience - cached by
+                                    # (path, mtime) so a steady image isn't re-read/re-encoded every poll (F22).
+                                    if full_fname:
+                                        data_url = _cached_data_url_for_file(EXPORT_DIR / full_fname)
+                                        if data_url:
+                                            cloud_mannequin['full_image_b64'] = data_url
+                                    if roi_fname:
+                                        data_url = _cached_data_url_for_file(EXPORT_DIR / roi_fname)
+                                        if data_url:
+                                            cloud_mannequin['roi_image_b64'] = data_url
                         except Exception:
                             pass
                 except Exception:
@@ -727,12 +833,13 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     full_path = EXPORT_DIR / full_fname if full_fname else None
                                     roi_path = EXPORT_DIR / roi_fname if roi_fname else None
 
-                                    if full_fname and (not full_path.exists()):
+                                    if full_fname and (not full_path.exists()) and _should_attempt_fetch(full_path):
                                         try:
                                             assignment = cloud_tent.get('assignment') or {}
                                             img_endpoint = None
                                             if isinstance(assignment, dict):
                                                 img_endpoint = (assignment.get('image') or {}).get('imageUrl') or (assignment.get('image') or {}).get('localImageUrl')
+                                            fetched = None
                                             if img_endpoint and hasattr(self, 'mapper') and getattr(self.mapper, 'work_client', None):
                                                 try:
                                                     fetched = self.mapper.work_client.get_image(img_endpoint)
@@ -743,8 +850,10 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                                             pass
                                                 except Exception:
                                                     pass
+                                            if fetched is None:
+                                                _record_fetch_failure(full_path)
                                         except Exception:
-                                            pass
+                                            _record_fetch_failure(full_path)
 
                                     if roi_fname and (not roi_path.exists()) and full_fname and (EXPORT_DIR / full_fname).exists():
                                         try:
@@ -764,18 +873,16 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                                     cloud_tent['full_image'] = full_fname if full_fname else None
                                     cloud_tent['roi_image'] = roi_fname if roi_fname else None
                                     cloud_tent['since_session_start_ms'] = _m.get('since_session_start_ms')
-                                    # Attach base64 image data for frontend convenience
-                                    try:
-                                        if full_fname and (EXPORT_DIR / full_fname).exists():
-                                            with open(EXPORT_DIR / full_fname, 'rb') as _fimg:
-                                                import base64 as _b64
-                                                cloud_tent['full_image_b64'] = 'data:image/jpeg;base64,' + _b64.b64encode(_fimg.read()).decode('utf-8')
-                                        if roi_fname and (EXPORT_DIR / roi_fname).exists():
-                                            with open(EXPORT_DIR / roi_fname, 'rb') as _fimg2:
-                                                import base64 as _b642
-                                                cloud_tent['roi_image_b64'] = 'data:image/jpeg;base64,' + _b642.b64encode(_fimg2.read()).decode('utf-8')
-                                    except Exception:
-                                        pass
+                                    # Attach base64 image data for frontend convenience - cached by
+                                    # (path, mtime) so a steady image isn't re-read/re-encoded every poll (F22).
+                                    if full_fname:
+                                        data_url = _cached_data_url_for_file(EXPORT_DIR / full_fname)
+                                        if data_url:
+                                            cloud_tent['full_image_b64'] = data_url
+                                    if roi_fname:
+                                        data_url = _cached_data_url_for_file(EXPORT_DIR / roi_fname)
+                                        if data_url:
+                                            cloud_tent['roi_image_b64'] = data_url
                         except Exception:
                             pass
                 except Exception:
@@ -1124,6 +1231,11 @@ class MapCommandHandler(BaseHTTPRequestHandler):
         try:
             data = self._read_json_body()
             label, assignment, roi, classification, model_source, gemini_reason = _parse_result_payload(data)
+            # Defaults so the notify_sse call below (and result_store.update's
+            # mf_name arg) are always defined even if the export-write block
+            # fails before setting its own copies.
+            label_name = str(label).lower() if label is not None else 'unknown'
+            mf_name = None
             # Save the full image and ROI crop to export/ for inspection
             try:
                 if not ensure_export_dir():
@@ -1185,6 +1297,13 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                     self.result_store.update(label, assignment, roi, classification, model_source, gemini_reason)
                 except Exception:
                     pass
+            # PIPELINE_AUDIT.md F20: this write path never told the frontend, so a
+            # pushed detection only appeared after the next 10s poll instead of
+            # immediately, unlike every other result_store.update() call site.
+            try:
+                notify_sse('gs_pull', {'label': label_name, 'meta': mf_name})
+            except Exception:
+                pass
             self._json_response(200, {"status": "ok", "label": data.get("label", str(label))})
         except Exception as e:
             print_red(f"[result_push] Failed to parse result payload: {e}")

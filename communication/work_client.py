@@ -155,7 +155,10 @@ class WorkClient(object):
 
         """
         while True:
-            response = requests.get(self.gs_url + self.attribute_endp)
+            # PIPELINE_AUDIT.md F36: no call site currently reaches this (dormant),
+            # but with no timeout a reactivated caller would hang this loop forever
+            # against a black-holed gs-backend.
+            response = requests.get(self.gs_url + self.attribute_endp, timeout=self.http_timeout_seconds)
             status_code, attrs = response.status_code, dict(response.json())
             if status_code != 200 or not attrs:
                 print_yellow(f"[work_client] Waiting for target attributes (status={status_code})")
@@ -209,7 +212,15 @@ class WorkClient(object):
                 return assignment, data
             else:
                 print_red(f"[work_client] Work request failed (status={status_code})")
-                break
+                # PIPELINE_AUDIT.md F31: this used to fall off the end here,
+                # implicitly returning a bare None. The caller unconditionally
+                # does `self.assignment, metadata = get_image_assignment()`,
+                # which raised TypeError trying to unpack it - caught two
+                # frames up with a 2s backoff, but as an accidental crash
+                # rather than an intended retry path. Explicit 2-tuple with a
+                # short pause here is the same end behavior, on purpose.
+                time.sleep(2)
+                return None, None
 
     def get_image(self, img_endpoint: str) -> Image.Image:
         """
@@ -234,7 +245,7 @@ class WorkClient(object):
             print_red(f"[work_client] Failed to fetch image from GS (status={response.status_code}, endpoint={img_endpoint})")
             return None
         
-    def send_image(self, img: Image.Image, assignment: dict) -> requests.Response:
+    def send_image(self, img: Image.Image, assignment: dict, meta: dict = None) -> requests.Response:
         if img is None:
             print_red("[work_client] Cannot send image to cloud: image is None")
             raise ValueError("img cannot be None")
@@ -247,8 +258,14 @@ class WorkClient(object):
         img.save(buffer, format=img_format)
         img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        payload = {"base64_image": img_base64, "id": assignment["id"], "meta": None, "assignment": assignment}
-        
+        # meta carries the GPS the cloud's mapping session needs. It was hardcoded
+        # to None here, so hawk-ai's _save_image_for_mapping bailed on every image
+        # and its mapping session never held anything.
+        payload = {"base64_image": img_base64, "id": assignment["id"], "meta": meta, "assignment": assignment}
+        if meta is None:
+            print_red(f"[work_client] Uploading image {assignment['id']} with no GPS meta - cloud mapping will skip it")
+
+
         logger.info("Sending image to cloud — id=%s url=%s", assignment["id"], self.cs_url + self.upload_img_endp)
         # Send request to cloud server
         try:
