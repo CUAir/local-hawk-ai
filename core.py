@@ -403,7 +403,7 @@ class VisionClient:
             # (mavproxy_cuairapi/views/targets.py) — no /target route exists anywhere.
             self.autopilot_url = f"http://{autopilot_host}/targets_set"
         # incremental id for autopilot messages
-        self._autopilot_id = 0
+        self._autopilot_id = 1
 
         self.result_interval_seconds = max(1.0, float(result_interval_seconds))
         self._send_lock = threading.Lock()
@@ -591,8 +591,9 @@ class VisionClient:
                     "gpsLocation": {
                         "latitude": float(lat),
                         "longitude": float(lon),
-                    },
-                },
+                    },    
+                }, 
+                "target_type": target_type_str.upper(),
             }
             print("PAYLOAD:", payload)
             try:
