@@ -630,8 +630,8 @@ class VisionClient:
                     "gpsLocation": {
                         "latitude": float(lat),
                         "longitude": float(lon),
-                    },    
-                }, 
+                    },
+                },
                 "target_type": target_type_str.upper(),
             }
             print("PAYLOAD:", payload)
