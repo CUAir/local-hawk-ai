@@ -37,6 +37,19 @@ class WorkClient(object):
         self.max_retries = 2
         self.retry_backoff = 1.0  # seconds, multiplied by attempt number
 
+        # Circuit breaker for send_image(): a dead/unreachable cloud otherwise
+        # costs up to ~11s (2 retries x 5s timeout + backoff) on every single
+        # image, serialized in core.py's single worker thread ahead of the
+        # next image pickup - with MPS capturing every few seconds, that
+        # backlog grows unboundedly for as long as the cloud stays down.
+        # Mirrors the same pattern already used for the MPS log-tab proxy
+        # (intsys_gs_api.py's LOG_PROXY_FAIL_THRESHOLD/LOG_PROXY_COOLDOWN_S).
+        # Only ever called from the single worker thread, so no lock needed.
+        self.cloud_upload_fail_threshold = 3
+        self.cloud_upload_cooldown_s = 30.0
+        self._cloud_upload_fails = 0
+        self._cloud_upload_open_until = 0.0
+
     def _do_request_with_retries(self, method: str, url: str, **kwargs) -> requests.Response:
         """Perform an HTTP request with simple retry/backoff for transient errors.
 
@@ -253,6 +266,11 @@ class WorkClient(object):
             print_red("[work_client] Cannot send image to cloud: missing assignment or assignment id")
             raise ValueError("assignment with id is required")
 
+        now = time.time()
+        if now < self._cloud_upload_open_until:
+            remaining = int(self._cloud_upload_open_until - now)
+            raise RuntimeError(f"cloud upload circuit open; retrying in {remaining}s (cloud unreachable)")
+
         buffer = io.BytesIO()
         img_format = img.format if img.format else "PNG"
         img.save(buffer, format=img_format)
@@ -271,16 +289,29 @@ class WorkClient(object):
         try:
             response = self._do_request_with_retries('post', self.cs_url + self.upload_img_endp, json=payload, timeout=self.http_timeout_seconds)
         except Exception as e:
+            self._register_cloud_upload_failure()
             print_red(f"[work_client] Failed to POST image to cloud after retries: {e}")
             raise
         logger.info("Cloud server response — id=%s status=%s", assignment["id"], response.status_code)
 
         if 200 <= response.status_code < 300:
+            self._cloud_upload_fails = 0
             print(f"[work_client] Uploaded image to cloud (assignment_id={assignment['id']}, status={response.status_code})")
         else:
+            self._register_cloud_upload_failure()
             print_red(f"[work_client] Cloud upload failed (assignment_id={assignment['id']}, status={response.status_code})")
 
         return response
+
+    def _register_cloud_upload_failure(self):
+        self._cloud_upload_fails += 1
+        if self._cloud_upload_fails >= self.cloud_upload_fail_threshold:
+            self._cloud_upload_open_until = time.time() + self.cloud_upload_cooldown_s
+            print_red(
+                f"[work_client] Cloud upload circuit breaker OPEN — "
+                f"{self._cloud_upload_fails} consecutive failures, pausing "
+                f"cloud uploads for {self.cloud_upload_cooldown_s:.0f}s"
+            )
 
     def clear_cloud(self) -> requests.Response:
         """DELETE /api/clear on the cloud server — resets its in-memory best

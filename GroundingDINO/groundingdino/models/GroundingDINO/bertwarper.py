@@ -108,8 +108,14 @@ class BertModelWarper(nn.Module):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
+        # transformers>=5 renamed get_extended_attention_mask's 3rd positional
+        # param from `device` to `dtype` (device is now inferred from
+        # attention_mask itself) - passing device positionally here landed it
+        # in the dtype slot and crashed inside transformers' internal
+        # `.to(dtype=<a torch.device>)` call. Omitting it works on both the
+        # old (device optional, inferred when None) and new signature.
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, device
+            attention_mask, input_shape
         )
 
         # If a 2D or 3D attention mask is provided for the cross-attention
