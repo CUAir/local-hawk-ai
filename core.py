@@ -1546,8 +1546,8 @@ if __name__ == "__main__":
                              "cloud freshness - see both_cloud_fresh). Every image is still pulled, "
                              "exported and fed to mapping, and every image is still uploaded to the "
                              "cloud regardless of this gate. A COUNT, not a duration: with MPS "
-                             "capturing every 2s, the default of 2 means local GD runs at most once "
-                             "per 4s. Use 1 to allow it every image.")
+                             "capturing every 2s, N=2 means local GD runs at most once per 4s. "
+                             "The default of 1 allows it on every image.")
 
     args = parser.parse_args()
 
