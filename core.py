@@ -1,4 +1,4 @@
-from communication.work_client import WorkClient
+from communication.work_client import WorkClient, telemetry_fields
 from models.classifiers import ImageNet
 from models.detectors import MaskRCNN
 from vision.detectors.abstract_detector import AbstractDetector
@@ -214,25 +214,25 @@ def _count_csv_rows() -> int:
 def _save_image_for_mapping_local(image: Image.Image, metadata: dict) -> bool:
     """
     Save a PIL image + GPS telemetry to the mapping session folder and append
-    a row to metadata.csv. Silently returns False if GPS data is absent.
+    a row to metadata.csv. Returns False if no GPS could be found for the image.
 
-    Field mapping: metadata["telemetry"]["yaw"] -> Degrees_Clockwise_from_North
-    (same meaning as hawk-ai's image.meta.heading)
+    Field mapping: telemetry.planeYaw -> Degrees_Clockwise_from_North (same
+    meaning as hawk-ai's image.meta.heading). The flat "latitude"/"longitude"/
+    "yaw" keys this used to read do not exist in gs-backend's payload, so every
+    image was silently dropped and the session never held anything. See
+    work_client.telemetry_fields for the shape gs-backend actually sends.
     """
-    telemetry = (metadata or {}).get("telemetry")
-    if not telemetry:
-        return False
-    lat = telemetry.get("latitude")
-    lon = telemetry.get("longitude")
+    lat, lon, alt, yaw = telemetry_fields((metadata or {}).get("telemetry"))
     if lat is None or lon is None:
+        print_yellow(f"[mapping] Skipped image {(metadata or {}).get('id')}: no GPS in telemetry")
         return False
+    if alt is None:
+        alt = 0
     try:
         image_id = metadata["id"]
         img_filename = f"{image_id}.jpg"
         img_path = MAPPING_SESSION_DIR / "images" / img_filename
         image.save(str(img_path), format="JPEG")
-        alt = telemetry.get("altitude", 0)
-        yaw = telemetry.get("yaw", 0)
         with open(MAPPING_CSV_PATH, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "Image", "Latitude", "Longitude", "Altitude", "Degrees_Clockwise_from_North"

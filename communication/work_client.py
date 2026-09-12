@@ -10,6 +10,49 @@ from utils.helper import print_green, print_yellow, print_red
 
 # Keep WorkClient logs plain to avoid excessive terminal coloring.
 
+def telemetry_fields(telemetry: dict) -> tuple:
+    """Extract (lat, lon, alt, heading) from a gs-backend telemetry block.
+
+    gs-backend nests GPS under "gps" and names the heading "planeYaw". Readers
+    that assumed flat "latitude"/"longitude"/"yaw" keys silently got None for
+    every image, which emptied every mapping session without logging anything.
+    This is the single definition of where those values live, imported by
+    core.py rather than re-derived there, so the two readers cannot drift apart
+    again.
+
+    Returns (None, None, None, None) when lat/lon are absent.
+    """
+    telemetry = telemetry or {}
+    gps = telemetry.get("gps") or {}
+    lat = gps.get("latitude")
+    lon = gps.get("longitude")
+    if lat is None or lon is None:
+        return None, None, None, None
+    heading = telemetry.get("planeYaw")
+    if heading is None:
+        heading = telemetry.get("yaw")
+    return lat, lon, telemetry.get("altitude"), (heading if heading is not None else 0.0)
+
+
+def image_meta_from_assignment(assignment: dict) -> typing.Optional[dict]:
+    """Build hawk-ai's `meta` block from the raw assignment blob.
+
+    Derived from `assignment` rather than threaded through from the caller
+    because send_image() already receives it, and it carries the same telemetry
+    under image.telemetry. Returns None when the assignment has no GPS, which is
+    the only case the cloud is entitled to skip for mapping.
+    """
+    img = (assignment or {}).get("image") or {}
+    lat, lon, alt, heading = telemetry_fields(img.get("telemetry"))
+    if lat is None or lon is None:
+        return None
+    return {
+        "location": {"lat": float(lat), "lon": float(lon), "alt": float(alt or 0.0)},
+        "heading": float(heading),
+        "has_real_geo": True,
+    }
+
+
 class WorkClient(object):
 
     def __init__(self, gs_socket: str, cs_socket : str):
@@ -247,7 +290,14 @@ class WorkClient(object):
         img.save(buffer, format=img_format)
         img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        payload = {"base64_image": img_base64, "id": assignment["id"], "meta": None, "assignment": assignment}
+        # `meta` carries the GPS hawk-ai's mapping session needs. It was hardcoded
+        # to None here, so the cloud's _save_image_for_mapping bailed on every
+        # image and its mapping session stayed empty for an entire flight, while
+        # every upload still returned 200.
+        meta = image_meta_from_assignment(assignment)
+        if meta is None:
+            print_red(f"[work_client] Uploading image {assignment['id']} with no GPS meta - cloud mapping will skip it")
+        payload = {"base64_image": img_base64, "id": assignment["id"], "meta": meta, "assignment": assignment}
         
         logger.info("Sending image to cloud — id=%s url=%s", assignment["id"], self.cs_url + self.upload_img_endp)
         # Send request to cloud server
