@@ -1416,8 +1416,8 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Intelligent Systems Client")
     parser.add_argument('--local', action='store_true', help="Use local IP address")
-    parser.add_argument('--gsip', type=str, default="127.0.0.1:9000", help="Specify ground station custom IP address") # 192.168.1.2:9000"; 10.48.199.45:9000
-    parser.add_argument('--csip', type=str, default="34.106.149.232:8000", help="Specify cloud server custom IP address")
+    parser.add_argument('--gsip', type=str, default="192.168.1.2:9000", help="Specify ground station custom IP address") # 10.48.199.45:9000
+    parser.add_argument('--csip', type=str, default="136.66.33.44:8000", help="Specify cloud server custom IP address")
     parser.add_argument('--server-port', type=int, default=9080, help="Port for the API/command HTTP server (dashboard API, SSE, exports, mapping/command endpoints)")
     parser.add_argument('--frontend-port', type=int, default=9081, help="Port for the frontend dashboard HTTP server")
     parser.add_argument('--interval-seconds', type=float, default=10.0, help="Run send_result() every F seconds")
