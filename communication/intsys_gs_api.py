@@ -888,6 +888,39 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                 self._json_response(200, result)
                 return
 
+            # --- Mapping progress + partial map --------------------------
+            # Both must sit above the fallthrough below: do_GET never 404s, so
+            # any route added after it returns the mapping-status body instead
+            # and is silently unreachable.
+            if path == '/api/mapping/progress':
+                self._json_response(200, self.mapper.get_progress())
+                return
+
+            if path == '/api/mapping/preview':
+                # The partial map: everything placed so far, unblended. Written
+                # atomically by the stitcher, so a read here is either the
+                # previous complete preview or the new one, never a torn file.
+                preview = getattr(self.mapper, 'preview_path', None)
+                try:
+                    data = Path(preview).read_bytes() if preview else None
+                except OSError:
+                    data = None
+                if not data:
+                    self._json_response(404, {
+                        "error": "no preview yet",
+                        "detail": "a preview appears once the stitch starts placing images",
+                    })
+                    return
+                self.send_response(200)
+                self.send_header('Content-type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(data)))
+                # Polled every few seconds while a stitch runs, and the path is
+                # reused across runs, so it must never come from cache.
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             # Default: mapping status (backwards compatibility)
             response = {
                 "mapping_running": self.mapper.mapping_running,

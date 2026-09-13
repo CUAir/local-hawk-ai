@@ -68,6 +68,7 @@ class WorkClient(object):
         self.upload_img_endp = "api/images"
         self.tent_img_endp = "api/images/tent"
         self.mannequin_img_endp = "api/images/mannequin"
+        self.mapping_trigger_endp = "api/mapping/trigger"
         self.mapping_status_endp = "api/mapping/status"
         self.mapping_result_endp = "api/mapping/result"
 
@@ -356,6 +357,45 @@ class WorkClient(object):
             print_red(f"[work_client] Ground server clear failed (status={response.status_code})")
 
         return response
+
+    def trigger_cloud_mapping(self) -> dict:
+        """POST /api/mapping/trigger on the cloud server.
+
+        Returns {"ok": bool, "detail": str} and never raises - the caller fires
+        this alongside the local stitch and must not be taken down by an
+        unreachable cloud.
+
+        Deliberately zero-retry despite being a POST: the cloud wipes its
+        mapping session at the end of every run, so a retried trigger whose
+        first response was merely lost could start a second run against an
+        already-emptied session and destroy the map the first one produced.
+
+        A 409 means the cloud is already stitching, which for an operator
+        pressing the button twice is success, not failure.
+        """
+        url = self.cs_url + self.mapping_trigger_endp
+        logger.info("Triggering cloud mapping — url=%s", url)
+        try:
+            response = requests.post(url, timeout=self.http_timeout_seconds)
+        except Exception as e:
+            logger.warning("Cloud mapping trigger unreachable — url=%s err=%s", url, e)
+            return {"ok": False, "detail": f"cloud unreachable: {e}"}
+
+        if response.status_code == 409:
+            return {"ok": True, "detail": "cloud stitch already running"}
+        if not (200 <= response.status_code < 300):
+            return {"ok": False, "detail": f"cloud returned {response.status_code}"}
+        try:
+            body = response.json()
+        except Exception:
+            return {"ok": True, "detail": "triggered"}
+        queued = body.get("images_queued")
+        if queued is not None and queued < 2:
+            # The cloud skips the run AND resets its session in this case, so
+            # reporting plain success would be misleading.
+            return {"ok": False,
+                    "detail": f"cloud had only {queued} image(s) - run skipped, session reset"}
+        return {"ok": True, "detail": f"triggered, {queued} image(s) queued"}
 
     def get_cloud_mapping_status(self) -> typing.Optional[dict]:
         """GET /api/mapping/status on the cloud server.

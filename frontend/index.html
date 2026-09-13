@@ -379,6 +379,249 @@
     </section>
   </main>
 
+  <!-- Mapping progress + partial map. Carries its own style and script
+       elements with map- prefixed names: the main script has a flat global
+       scope, so a duplicate top-level binding there blanks the whole page,
+       and scoping this feature to its own elements means a fault can only
+       break itself. Sits outside the board because .board is a fixed
+       three-column grid - a fourth section inside it wraps onto a second row
+       instead of becoming a column - and outside the panels refresh() wipes
+       every 10 seconds. -->
+  <style>
+    .mappanel { padding: 0 20px 20px; }
+    .mappanel-box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .mappanel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .mappanel-title { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+    .mappanel-pill {
+      font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+    }
+    .mappanel-pill.live { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+    .mappanel-pill.bad { color: var(--red); border-color: var(--red); }
+    .mappanel-elapsed { font-size: 11.5px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+    .mappanel-track {
+      position: relative; height: 7px; border-radius: 999px;
+      background: var(--surface-2); overflow: hidden;
+    }
+    .mappanel-fill {
+      position: absolute; inset: 0 auto 0 0; width: 0%;
+      background: var(--accent); border-radius: 999px;
+      transition: width .3s ease;
+    }
+    /* Indeterminate: blending builds its pyramids over the whole placed set
+       and yields nothing until it finishes, so there is no honest percentage
+       to show for it. */
+    .mappanel-track.indeterminate .mappanel-fill {
+      width: 32%; animation: mappanel-slide 1.5s ease-in-out infinite;
+    }
+    @keyframes mappanel-slide {
+      0%   { transform: translateX(-110%); }
+      100% { transform: translateX(330%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .mappanel-track.indeterminate .mappanel-fill { animation: none; width: 100%; opacity: .45; }
+      .mappanel-fill { transition: none; }
+    }
+    .mappanel-meta { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .mappanel-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .mappanel-preview {
+      display: none; border: 1px solid var(--border); border-radius: 8px;
+      overflow: hidden; background: var(--bg);
+    }
+    .mappanel-preview.shown { display: block; }
+    .mappanel-preview img { display: block; width: 100%; height: auto; }
+    .mappanel-preview figcaption {
+      font-size: 11.5px; color: var(--muted);
+      padding: 7px 10px; border-top: 1px solid var(--border);
+    }
+    @media (max-width: 720px) { .mappanel { padding: 0 14px 16px; } }
+  </style>
+
+  <section class="mappanel" aria-label="Mapping">
+    <div class="mappanel-box">
+      <div class="mappanel-head">
+        <span class="mappanel-title">Mapping</span>
+        <span class="mappanel-pill" id="map-phase">idle</span>
+        <span class="mappanel-elapsed" id="map-elapsed"></span>
+      </div>
+
+      <div class="mappanel-track" id="map-track" role="progressbar"
+           aria-label="Stitch progress" aria-valuemin="0" aria-valuemax="100">
+        <div class="mappanel-fill" id="map-fill"></div>
+      </div>
+
+      <div class="mappanel-meta" id="map-meta">&mdash;</div>
+
+      <div class="mappanel-row">
+        <button id="map-run" class="btn btn-accent">Run Mapping</button>
+        <a id="map-grab" class="btn" href="#" target="_blank" rel="noopener"
+           download="map_so_far.jpg" hidden>Save Map So Far</a>
+        <span class="action-status" id="map-status"></span>
+      </div>
+
+      <figure class="mappanel-preview" id="map-preview" style="margin:0">
+        <img id="map-preview-img" alt="Partial map: images placed so far" />
+        <figcaption id="map-preview-cap"></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <script>
+  // Mapping progress + partial map. Wrapped in an IIFE with its own `var API`,
+  // matching the capture bar and log panel: each script element is compiled
+  // independently, so a fault here cannot blank the rest of the dashboard.
+  (function () {
+    'use strict';
+    var API = (window.MAP_API_BASE && window.MAP_API_BASE.indexOf('http') === 0) ? window.MAP_API_BASE : '';
+
+    var elPhase   = document.getElementById('map-phase');
+    var elElapsed = document.getElementById('map-elapsed');
+    var elTrack   = document.getElementById('map-track');
+    var elFill    = document.getElementById('map-fill');
+    var elMeta    = document.getElementById('map-meta');
+    var elRun     = document.getElementById('map-run');
+    var elGrab    = document.getElementById('map-grab');
+    var elStatus  = document.getElementById('map-status');
+    var elPrev    = document.getElementById('map-preview');
+    var elPrevImg = document.getElementById('map-preview-img');
+    var elPrevCap = document.getElementById('map-preview-cap');
+
+    // phase -> [label, determinate]. Determinate phases report done/total;
+    // the rest have no honest per-unit measure.
+    var PHASES = {
+      idle:     ['idle', false],
+      starting: ['starting', false],
+      loading:  ['loading images', true],
+      features: ['finding features', true],
+      placing:  ['placing images', true],
+      refining: ['refining alignment', false],
+      blending: ['blending (no progress available)', false],
+      saving:   ['saving', false],
+      done:     ['done', false],
+      skipped:  ['skipped', false],
+      error:    ['error', false]
+    };
+    var ACTIVE = ['starting', 'loading', 'features', 'placing', 'refining', 'saving'];
+
+    var lastPreviewTs = null;
+
+    function fmtElapsed(sec) {
+      if (sec === null || sec === undefined || !isFinite(sec) || sec < 0) return '';
+      var m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+      return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+    }
+
+    function render(p) {
+      var phase = p.phase || 'idle';
+      var spec = PHASES[phase] || [phase, false];
+      var running = !!p.running;
+
+      elPhase.textContent = spec[0];
+      elPhase.className = 'mappanel-pill' +
+        (phase === 'error' || phase === 'skipped' ? ' bad' : (running ? ' live' : ''));
+
+      // Elapsed keeps ticking from the run's start, not the current phase.
+      elElapsed.textContent = p.started_ts && (running || phase === 'done')
+        ? fmtElapsed((p.updated_ts || (Date.now() / 1000)) - p.started_ts) + ' elapsed'
+        : '';
+
+      var determinate = spec[1] && p.total;
+      if (determinate) {
+        var pct = Math.max(0, Math.min(100, Math.round((p.done / p.total) * 100)));
+        elTrack.classList.remove('indeterminate');
+        elFill.style.width = pct + '%';
+        elTrack.setAttribute('aria-valuenow', String(pct));
+      } else if (running) {
+        elTrack.classList.add('indeterminate');
+        elTrack.removeAttribute('aria-valuenow');
+      } else {
+        elTrack.classList.remove('indeterminate');
+        elFill.style.width = (phase === 'done' ? '100%' : '0%');
+        elTrack.setAttribute('aria-valuenow', phase === 'done' ? '100' : '0');
+      }
+
+      var bits = [];
+      if (determinate) bits.push(p.done + ' / ' + p.total);
+      bits.push(p.images_queued + ' image(s) in session');
+      if (p.detail) bits.push(p.detail);
+      if (p.last_result) bits.push('local: ' + p.last_result.split('/').pop());
+      if (p.cloud_last_result) bits.push('cloud: ' + p.cloud_last_result.split('/').pop());
+      if (p.cloud_trigger && !p.cloud_trigger.ok) bits.push('cloud trigger: ' + p.cloud_trigger.detail);
+      elMeta.textContent = bits.join('  \u00b7  ');
+
+      elRun.disabled = false;
+      elRun.textContent = running ? 'Mapping Running\u2026' : 'Run Mapping';
+
+      // Only re-fetch the image when the file actually changed - it is a full
+      // JPEG over the wire on every poll otherwise.
+      if (p.preview_available) {
+        elGrab.hidden = false;
+        elGrab.href = API + '/api/mapping/preview';
+        elPrev.classList.add('shown');
+        if (p.preview_ts !== lastPreviewTs) {
+          lastPreviewTs = p.preview_ts;
+          elPrevImg.src = API + '/api/mapping/preview?t=' + encodeURIComponent(String(p.preview_ts));
+          elPrevCap.textContent = 'Images placed so far, unblended \u2014 seams and exposure '
+            + 'differences are expected. Stops updating once blending starts.';
+        }
+      } else {
+        elGrab.hidden = true;
+        elPrev.classList.remove('shown');
+        lastPreviewTs = null;
+      }
+
+      return running;
+    }
+
+    var timer = null;
+    function schedule(ms) {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(poll, ms);
+    }
+
+    async function poll() {
+      var running = false;
+      try {
+        var r = await fetch(API + '/api/mapping/progress', { cache: 'no-store' });
+        if (r.ok) running = render(await r.json());
+        else elStatus.textContent = 'progress unavailable (HTTP ' + r.status + ')';
+      } catch (e) {
+        elPhase.textContent = 'unreachable';
+        elPhase.className = 'mappanel-pill bad';
+      }
+      // Fast while a stitch is live, slow otherwise. Polled rather than pushed
+      // over /api/stream: every SSE connection here permanently leaks a thread.
+      schedule(running ? 1500 : 6000);
+    }
+
+    elRun.addEventListener('click', async function () {
+      elRun.disabled = true;
+      elStatus.className = 'action-status';
+      elStatus.textContent = 'Triggering local and cloud stitch\u2026';
+      try {
+        var r = await fetch(API + '/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'trigger_mapping' })
+        });
+        var body = await r.json();
+        elStatus.className = 'action-status ' + (body.status === 'success' ? 'success' : 'error');
+        elStatus.textContent = body.message || body.status;
+      } catch (e) {
+        elStatus.className = 'action-status error';
+        elStatus.textContent = 'Trigger failed: ' + e;
+      }
+      schedule(300);
+    });
+
+    poll();
+  })();
+  </script>
+
   <section class="logpanel" aria-label="Service logs">
     <details id="logpanel-details">
       <summary>

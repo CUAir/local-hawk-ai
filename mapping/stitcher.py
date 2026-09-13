@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import gc
+import os
+from pathlib import Path
 from typing import List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -130,6 +132,35 @@ def _remove_indices(placed_indices, placed_info, indices, reason):
         placed_info.pop(idx, None)
 
 
+# opencv-python 5.x dropped AKAZE from the base wheel (it lives in
+# opencv-contrib-python). AKAZE is only ever a conditional fallback here - see
+# `akaze_poor` and the `des_a_new is not None` guards below, which already treat
+# absent AKAZE descriptors as a normal state - so a missing detector degrades
+# the stitch to SIFT-only rather than killing the whole run with an
+# AttributeError before the first image is placed. Warned once, not per image.
+_AKAZE_WARNED = False
+
+
+def _make_akaze():
+    global _AKAZE_WARNED
+    factory = getattr(cv2, "AKAZE_create", None)
+    if factory is None:
+        if not _AKAZE_WARNED:
+            _AKAZE_WARNED = True
+            print("  [features] cv2.AKAZE_create unavailable "
+                  f"(opencv {cv2.__version__}); running SIFT-only. Install "
+                  "opencv-contrib-python, or pin opencv-python<5, to restore "
+                  "the AKAZE fallback and its stitch quality.")
+        return None
+    try:
+        return factory(threshold=AKAZE_THRESH)
+    except Exception as e:
+        if not _AKAZE_WARNED:
+            _AKAZE_WARNED = True
+            print(f"  [features] AKAZE unavailable ({e}); running SIFT-only.")
+        return None
+
+
 def _extract_one(args):
     """Extract SIFT(primary) + AKAZE(fallback) features for one image."""
     i, img = args
@@ -137,8 +168,10 @@ def _extract_one(args):
     clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(CLAHE_TILE, CLAHE_TILE))
     enhanced = clahe.apply(gray)
     sift = cv2.SIFT_create(nfeatures=SIFT_FEATURES, contrastThreshold=SIFT_CONTRAST)
-    akaze = cv2.AKAZE_create(threshold=AKAZE_THRESH)
     kp_s, des_s = sift.detectAndCompute(enhanced, None)
+    akaze = _make_akaze()
+    if akaze is None:
+        return i, (kp_s, des_s, None, None)
     kp_a, des_a = akaze.detectAndCompute(enhanced, None)
     return i, (kp_s, des_s, kp_a, des_a)
 
@@ -151,10 +184,21 @@ def stitch_geolocated_images(images: List[np.ndarray],
                               coordinates: List[Tuple[float, float]],
                               match_threshold: int = 10,
                               skip_assembly: bool = False,
-                              ppm: float = 30.0):
+                              ppm: float = 30.0,
+                              preview_path=None,
+                              progress_cb=None):
     """
     GPS-guided SIFT stitcher using full 8-DOF homography, Voronoi seam
     finding, and Laplacian pyramid blending.
+
+    preview_path: where to write the running unblended composite of everything
+        placed so far. None disables previews entirely. Previews only exist
+        during placement - blending builds Laplacian pyramids across the whole
+        placed set at once and produces no pixels until it finishes, so there
+        is nothing partial to show after placement ends.
+    progress_cb: called as progress_cb(phase, done, total) at phase boundaries
+        and as countable work advances. done/total are None for phases with no
+        per-unit measure. Never allowed to break the run - see _report.
 
     Returns (canvas, placed_indices, placed_info).
     """
@@ -162,6 +206,22 @@ def stitch_geolocated_images(images: List[np.ndarray],
         return None, [], {}
 
     num_images = len(images)
+
+    def _report(phase, done=None, total=None):
+        """Progress reporting is diagnostic, so a broken callback must never
+        take the stitch down with it."""
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(phase, done, total)
+        except Exception:
+            pass
+
+    # Preview cadence scales with the run: every placement on a short flight
+    # (where the fixed PREVIEW_EVERY=25 meant a 30-image run got one preview
+    # after the first ten), thinning out on a long one so writing the preview
+    # never starts costing more than placing the images.
+    preview_every = max(1, min(PREVIEW_EVERY, num_images // 20))
     PPM = float(ppm) if np.isfinite(ppm) and ppm > 0 else 30.0
     print(f"Using PPM={PPM:.2f} for GPS constraints")
     ref_lat = coordinates[0][0]
@@ -182,12 +242,17 @@ def stitch_geolocated_images(images: List[np.ndarray],
 
     # --- PARALLEL feature extraction ---
     print(f"Pre-computing features (SIFT primary + AKAZE fallback, {NUM_WORKERS} workers)...")
+    _report("features", 0, num_images)
     img_features = [None] * num_images
+    extracted = 0
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         for i, feat in executor.map(_extract_one, enumerate(images)):
             img_features[i] = feat
+            extracted += 1
+            _report("features", extracted, num_images)
             if (i + 1) % 50 == 0:
                 print(f"  Extracted {i+1}/{num_images}")
+    _report("placing", len(placed_indices), num_images)
 
     bf_l2 = cv2.BFMatcher(cv2.NORM_L2)
     bf_ham = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -313,6 +378,7 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 unplaced.remove(i)
                 placed_in_pass += 1
                 _grid_add(placed_grid, i, positions[i], cell_size)
+                _report("placing", len(placed_indices), num_images)
                 continue
 
             # Find GPS-close placed images as anchor candidates
@@ -375,8 +441,9 @@ def stitch_geolocated_images(images: List[np.ndarray],
                 _grid_add(placed_grid, i, positions[i], cell_size)
                 # Record for refinement: H_rel maps i → anchor
                 placement_links.append((i, best_anchor, best_H_rel))
-                if i < 10 or placed_in_pass % PREVIEW_EVERY == 0:
-                    _save_preview(images, placed_indices, placed_info)
+                _report("placing", len(placed_indices), num_images)
+                if i < 10 or placed_in_pass % preview_every == 0:
+                    _save_preview(images, placed_indices, placed_info, preview_path)
 
         if placed_in_pass == 0:
             print("No more images could be linked. Terminating passes.")
@@ -399,9 +466,12 @@ def stitch_geolocated_images(images: List[np.ndarray],
             placed_indices.append(i)
             placed_info[i] = {"H": placed_H, "pos": positions[i], "gps_fallback": True}
             print(f"  Image {i} placed by GPS fallback.")
+            _report("placing", len(placed_indices), num_images)
+    _save_preview(images, placed_indices, placed_info, preview_path)
 
     # --- GLOBAL REFINEMENT ---
     # Reuse already-computed placement H_rels (no extra SIFT matching needed).
+    _report("refining", None, None)
     print(f"Refining poses with {len(placement_links)} placement constraints...")
     for iteration in range(REFINE_MAX_ITERS):
         total_delta, count_delta = 0.0, 0
@@ -698,6 +768,11 @@ def stitch_geolocated_images(images: List[np.ndarray],
     # --- SSIM seam consistency diagnostic ---
     compute_seam_ssim(images, placed_indices, placed_info, positions)
 
+    # No per-unit progress past this point: _assemble_blended_map builds its
+    # Laplacian pyramids over the whole placed set and yields pixels only at
+    # the end, so this phase is genuinely indeterminate rather than being
+    # reported as a fake percentage.
+    _report("blending", None, None)
     print("Assembling final map...")
     canvas = _assemble_blended_map(images, placed_indices, placed_info)
     return canvas, placed_indices, placed_info
@@ -1225,7 +1300,20 @@ def _build_gaussian_pyramid(img, levels, level_shapes):
 # Preview helper
 # ---------------------------------------------------------------------------
 
-def _save_preview(images, placed_indices, placed_info):
+def _save_preview(images, placed_indices, placed_info, preview_path=None):
+    """Write an unblended composite of everything placed so far.
+
+    Last-write-wins paste, downscaled to 1200px: visible seams and no exposure
+    matching, which is the point - it is the "we are out of time, give me what
+    you have" artifact, not a deliverable orthomosaic.
+
+    Written to a temp file and renamed, because the dashboard polls this path
+    and a half-written JPEG would decode as a broken image. A None path
+    disables previews rather than dropping a file in the process CWD, which is
+    what the old hardcoded relative filename did.
+    """
+    if preview_path is None or not placed_indices:
+        return
     try:
         all_pts = []
         for idx in placed_indices:
@@ -1246,6 +1334,17 @@ def _save_preview(images, placed_indices, placed_info):
             H_c = H_pre.dot(placed_info[idx]["H"])
             warped = cv2.warpPerspective(images[idx], H_c, (tw, th))
             preview[np.any(warped > 10, axis=2)] = warped[np.any(warped > 10, axis=2)]
-        cv2.imwrite("stitch_progress.jpg", preview)
-    except Exception:
-        pass
+        preview_path = Path(preview_path)
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the real image extension on the temp name: cv2.imwrite picks its
+        # encoder from the extension, so a plain ".tmp" suffix makes it fail
+        # with "could not find a writer for the specified extension".
+        tmp = preview_path.with_name(preview_path.stem + ".tmp" + preview_path.suffix)
+        if cv2.imwrite(str(tmp), preview):
+            os.replace(tmp, preview_path)
+        else:
+            print(f"  [preview] cv2.imwrite returned False for {tmp}")
+    except Exception as e:
+        # Previews are best-effort, but a silent `pass` made a broken preview
+        # indistinguishable from a run that had not reached one yet.
+        print(f"  [preview] Failed to write {preview_path}: {e}")

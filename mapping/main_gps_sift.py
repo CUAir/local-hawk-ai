@@ -220,7 +220,8 @@ class GpsSiftPipeline:
         self.require_telemetry = require_telemetry
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def run(self, image_folder: str, csv_path: Optional[str] = None) -> str:
+    def run(self, image_folder: str, csv_path: Optional[str] = None,
+            progress_cb=None, preview_path=None) -> str:
         """
         Run the full GPS + SIFT + Laplacian pipeline.
 
@@ -228,11 +229,25 @@ class GpsSiftPipeline:
             image_folder: Folder containing drone images.
             csv_path: Path to telemetry CSV. If None, looks for
                       <image_folder>.csv; extracts from DJI XMP if missing.
+            progress_cb: progress_cb(phase, done, total) - see
+                      stitch_geolocated_images. None disables reporting.
+            preview_path: where the running partial composite is written.
+                      None disables previews.
 
         Returns:
             Path to the saved orthomosaic JPEG.
         """
         t0 = time.time()
+
+        def _report(phase, done=None, total=None):
+            if progress_cb is None:
+                return
+            try:
+                progress_cb(phase, done, total)
+            except Exception:
+                pass
+
+        _report("loading", None, None)
         folder = Path(image_folder)
 
         # --- Resolve / auto-generate CSV ---
@@ -337,8 +352,12 @@ class GpsSiftPipeline:
             workers,
         )
         ppm_samples: List[float] = []
+        loaded = 0
+        _report("loading", 0, len(preprocess_jobs))
         with executor_cls(max_workers=workers) as executor:
             for name, img, coord, ppm_sample, error in executor.map(_preprocess_one, preprocess_jobs):
+                loaded += 1
+                _report("loading", loaded, len(preprocess_jobs))
                 if img is None or coord is None:
                     skipped += 1
                     if error == "read_failed":
@@ -365,7 +384,10 @@ class GpsSiftPipeline:
         t_stitch = time.time()
         ppm = float(np.median(ppm_samples)) if ppm_samples else 30.0
         self.logger.info("Using estimated PPM=%.2f from %d image(s)", ppm, len(ppm_samples))
-        canvas, placed_indices, _ = stitch_geolocated_images(images, coordinates, ppm=ppm)
+        canvas, placed_indices, _ = stitch_geolocated_images(
+            images, coordinates, ppm=ppm,
+            preview_path=preview_path, progress_cb=progress_cb,
+        )
         elapsed_stitch = time.time() - t_stitch
 
         if canvas is None:
@@ -379,6 +401,7 @@ class GpsSiftPipeline:
         )
 
         # --- Save output ---
+        _report("saving", None, None)
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         pictureset = re.sub(r"[^a-z0-9]+", "-", folder.name.lower()).strip("-")
         filename = f"{date_str}_{pictureset}_{self.test_type}.jpg"

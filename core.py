@@ -181,6 +181,9 @@ MAX_BOX_FRACTION = 0.5
 # Mapping pipeline constants (mirrors hawk-ai/main.py)
 MAPPING_SESSION_DIR = Path(__file__).parent / "mapping" / "current_session"
 MAPPING_OUTPUT_DIR  = Path(__file__).parent / "mapping" / "outputs"
+# Running partial composite, kept out of outputs/ so it can never be mistaken
+# for a finished map by anyone browsing that folder.
+MAPPING_PREVIEW_PATH = Path(__file__).parent / "mapping" / "preview" / "stitch_progress.jpg"
 MAPPING_CSV_PATH    = MAPPING_SESSION_DIR / "metadata.csv"
 IDLE_MAPPING_TIMEOUT_SECONDS = 20
 IDLE_MAPPING_POLL_SECONDS = 1
@@ -259,10 +262,22 @@ def _run_pipeline_local(mapper) -> None:
     """
     from mapping.main_gps_sift import GpsSiftPipeline
 
+    # Drop any preview left by the previous flight before announcing this run,
+    # so /api/mapping/preview can never serve a stale map as if it were the
+    # current one.
+    try:
+        MAPPING_PREVIEW_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print_yellow(f"[mapping] Could not clear old preview: {e}")
+
+    mapper.set_progress("starting")
     mapper.mapping_running = True
     n_images = _count_csv_rows()
 
     if n_images < 2:
+        mapper.set_progress("skipped")
         print_yellow(f"[mapping] Only {n_images} image(s) in session — skipping pipeline")
         _reset_session()
         mapper.mapping_running = False
@@ -276,11 +291,15 @@ def _run_pipeline_local(mapper) -> None:
         raw_path = pipeline.run(
             str(MAPPING_SESSION_DIR / "images"),
             str(MAPPING_CSV_PATH),
+            progress_cb=mapper.set_progress,
+            preview_path=str(MAPPING_PREVIEW_PATH),
         )
         Path(raw_path).rename(final_out)
         mapper.mapping_result = final_out
+        mapper.set_progress("done")
         print(f"[mapping] Done → {final_out}")
     except Exception as e:
+        mapper.set_progress("error", detail=str(e))
         print_red(f"[mapping] Pipeline error: {e}")
     finally:
         _reset_session()
@@ -308,13 +327,102 @@ class Mapper:
         self.cloud_mapping_result = None
         self._seen_cloud_results = set()
 
-    def trigger_pipeline(self):
-        """Trigger the hawk-ai GpsSiftPipeline in a background thread."""
+        # Live progress for the local stitch. Written from the pipeline thread
+        # via set_progress and read from HTTP handler threads, so it is guarded
+        # and always replaced wholesale rather than mutated field by field.
+        # Handed to the HTTP layer through this attribute rather than imported:
+        # core imports intsys_gs_api, so the handler cannot import back.
+        self.preview_path = MAPPING_PREVIEW_PATH
+        self._progress_lock = threading.Lock()
+        self._progress = {"phase": "idle", "done": None, "total": None,
+                          "detail": None, "started_ts": None, "updated_ts": None}
+        # Result of the most recent attempt to trigger the cloud's own stitch,
+        # surfaced next to the local progress so one panel covers both.
+        self.cloud_trigger_status = None
+
+    def trigger_pipeline(self, include_cloud: bool = True):
+        """Trigger the local GpsSiftPipeline, and by default the cloud's too.
+
+        The two sessions are independent, so a single operator action has to
+        start both or the cloud map silently never gets made. The cloud call is
+        fired first and on its own thread: it is best-effort, and an
+        unreachable cloud must not stop the local stitch from running.
+
+        A local run already in progress does not block the cloud trigger - the
+        cloud tracks its own run state and answers 409 itself if it is busy.
+        """
+        if include_cloud:
+            self.trigger_cloud_pipeline()
+
         if self.mapping_running:
-            print_yellow("[mapping] Pipeline already running — ignoring trigger")
+            print_yellow("[mapping] Local pipeline already running — ignoring local trigger")
             return
         threading.Thread(target=_run_pipeline_local, args=(self,), daemon=True).start()
         print("[mapping] Pipeline triggered in background thread")
+
+    def set_progress(self, phase: str, done=None, total=None, detail=None):
+        """Record pipeline progress. Called from the stitcher's own thread as a
+        progress_cb, and directly for the phases core.py owns.
+
+        `starting` stamps the run's start time; every other phase keeps it, so
+        the dashboard can show elapsed time across the whole run rather than
+        per phase.
+        """
+        now = time.time()
+        with self._progress_lock:
+            started = now if phase == "starting" else self._progress.get("started_ts")
+            self._progress = {
+                "phase": phase,
+                "done": done,
+                "total": total,
+                "detail": detail,
+                "started_ts": started,
+                "updated_ts": now,
+            }
+
+    def get_progress(self) -> dict:
+        """Snapshot of local stitch progress, plus whether a partial map exists.
+
+        `preview_available` is resolved at read time rather than tracked, so a
+        preview deleted underneath us is reported honestly.
+        """
+        with self._progress_lock:
+            snap = dict(self._progress)
+        snap["running"] = self.mapping_running
+        snap["last_result"] = self.mapping_result
+        snap["cloud_last_result"] = self.cloud_mapping_result
+        snap["cloud_trigger"] = self.cloud_trigger_status
+        snap["images_queued"] = _count_csv_rows()
+        try:
+            # self.preview_path, not the module constant: the HTTP preview route
+            # serves this same attribute, and two readers of "where the preview
+            # lives" that can disagree is exactly how the mapping session came
+            # to be silently empty in the first place.
+            snap["preview_available"] = self.preview_path.exists()
+            snap["preview_ts"] = (self.preview_path.stat().st_mtime
+                                  if snap["preview_available"] else None)
+        except Exception:
+            snap["preview_available"] = False
+            snap["preview_ts"] = None
+        return snap
+
+    def trigger_cloud_pipeline(self):
+        """Ask the cloud to stitch its own session.
+
+        The cloud keeps a completely separate mapping session fed by
+        POST /api/images, so its run has to be started separately - triggering
+        the local pipeline does nothing to it. Runs on its own thread because
+        the HTTP call can block for the full request timeout and must not hold
+        up the local trigger it is fired alongside.
+        """
+        def _go():
+            resp = self.work_client.trigger_cloud_mapping()
+            self.cloud_trigger_status = resp
+            if resp.get("ok"):
+                print_green(f"[mapping] Cloud stitch triggered ({resp.get('detail')})")
+            else:
+                print_yellow(f"[mapping] Cloud stitch not triggered: {resp.get('detail')}")
+        threading.Thread(target=_go, daemon=True, name="cloud-map-trigger").start()
 
     def mark_image_received(self):
         """Record timestamp of the latest received image."""
@@ -384,7 +492,9 @@ class Mapper:
             f"[mapping] Idle for {timeout_seconds}s with {n_images} images; auto-triggering pipeline"
         )
         self.last_auto_trigger_ts = time.time()
-        self.trigger_pipeline()
+        # Local only: the idle heuristic fires repeatedly and unattended, and
+        # should not be POSTing at the cloud on its own.
+        self.trigger_pipeline(include_cloud=False)
 
 class VisionClient:
     def __init__(self, work_client : WorkClient, mapper : Mapper, result_store: ResultStore, autopilot_host: str = None, result_interval_seconds: float = 10.0):
