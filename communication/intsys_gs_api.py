@@ -229,10 +229,15 @@ class ResultStore:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # Separate storage for cloud-pulled entries (most-recent wins)
+        # Separate storage for cloud-pulled entries (highest-confidence wins)
         self._cloud: dict = {"tent": None, "mannequin": None}
         # Storage for best GD backups per label (highest-confidence wins)
         self._gd_best: dict = {"tent": None, "mannequin": None}
+        # Wall-clock time of the most recent cloud update per label, regardless
+        # of whether it replaced the displayed entry. Lets callers ask "is the
+        # cloud actively producing results for this label right now" (used to
+        # stand down the redundant local GD pass once it is).
+        self._cloud_updated_at: dict = {"tent": None, "mannequin": None}
 
     def update(self, label: LabelType, assignment: dict, roi: ROI, classification: Classification, model_source: str = "", gemini_reason: str = "", meta_filename: str = None):
        """Update the store.
@@ -259,14 +264,30 @@ class ResultStore:
                 print_yellow(f"[result_store] Received unknown label: {label}")
                 return
 
-            # Cloud entries win unconditionally (most-recent cloud_pull overrides anything)
+            # Cloud entries: kept only if confidence is >= the current cloud best for
+            # this label (>= rather than > so an equally-confident, more-recent
+            # sighting still refreshes the displayed image/timestamp). This used to be
+            # "most-recent cloud_pull overrides anything", which let a low-confidence
+            # detection silently replace a high-confidence one -- contradicting this
+            # method's own "canonical cloud best" framing.
             if model_source and 'cloud' in model_source:
-                self._cloud[lbl] = entry
+                self._cloud_updated_at[lbl] = time.time()
                 try:
                     conf = float(classification.label[1]) if classification is not None else 0.0
                 except Exception:
                     conf = 0.0
-                print(f"[result_store] Updated cloud {lbl} (conf={conf:.3f}, model={model_source})")
+                prev = self._cloud.get(lbl)
+                prev_conf = -1.0
+                if prev is not None and len(prev) >= 3 and prev[2] is not None:
+                    try:
+                        prev_conf = float(prev[2].label[1])
+                    except Exception:
+                        prev_conf = -1.0
+                if prev is None or conf >= prev_conf:
+                    self._cloud[lbl] = entry
+                    print(f"[result_store] Updated cloud {lbl} (conf={conf:.3f}, model={model_source})")
+                else:
+                    print(f"[result_store] Kept existing cloud {lbl} (conf={prev_conf:.3f}) over new {conf:.3f}")
                 return
 
             # GD backup: keep only the highest-confidence GD backup for this label
@@ -291,6 +312,7 @@ class ResultStore:
 
             # Fallback: treat other model sources as cloud entries
             self._cloud[lbl] = entry
+            self._cloud_updated_at[lbl] = time.time()
             print(f"[result_store] Updated cloud-like {lbl} (model={model_source})")
 
     def get_mannequin(self):
@@ -301,6 +323,22 @@ class ResultStore:
     def get_tent(self):
         with self._lock:
             return self._cloud.get('tent') or self._gd_best.get('tent')
+
+    def both_cloud_fresh(self, max_age_s: float) -> bool:
+        """True when both labels have a cloud result newer than max_age_s.
+
+        Used to stand down the redundant local GroundingDINO pass once the
+        cloud is confirmed actively producing results for everything it could
+        find in a frame - GD's single detection pass can't selectively skip
+        just one label, so this is necessarily an all-or-nothing gate.
+        """
+        with self._lock:
+            now = time.time()
+            for lbl in ("tent", "mannequin"):
+                ts = self._cloud_updated_at.get(lbl)
+                if ts is None or (now - ts) > max_age_s:
+                    return False
+            return True
 
     def clear(self):
         """Reset all in-memory best results (cloud-pulled and GD backup)."""
