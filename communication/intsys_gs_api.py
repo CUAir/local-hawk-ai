@@ -345,6 +345,11 @@ class ResultStore:
         with self._lock:
             self._cloud = {"tent": None, "mannequin": None}
             self._gd_best = {"tent": None, "mannequin": None}
+            # Must be reset alongside the entries it describes. Left standing, a
+            # cleared store still reported both_cloud_fresh() == True for the
+            # rest of the window, so the local GD pass would stand down for a
+            # cloud that had just been emptied.
+            self._cloud_updated_at = {"tent": None, "mannequin": None}
         print_green("[result_store] Cleared all in-memory best results")
 
     def rebuild_from_disk(self, export_dir: Path):
@@ -974,6 +979,36 @@ class MapCommandHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(_json.dumps({"status": "error", "message": str(e)}).encode())
 
+    def _clear_local(self) -> dict:
+        """Clear every piece of local state: the export folder the dashboard
+        renders from, the in-memory result store, the mapping session and its
+        CSV, and the per-flight caches on the mapper and vision client.
+
+        Kept in one place because clear_local and clear_all both need exactly
+        this, and the failure mode of the old code was precisely that different
+        clear paths cleared different subsets.
+        """
+        deleted = 0
+        if EXPORT_DIR.exists():
+            for f in EXPORT_DIR.iterdir():
+                if f.is_file():
+                    try:
+                        f.unlink()
+                        deleted += 1
+                    except Exception:
+                        pass
+        if self.result_store is not None:
+            self.result_store.clear()
+        if self.mapper is not None:
+            self.mapper.reset_state()
+        # vision_client is set once the worker loop is up; a clear issued before
+        # then has no per-flight caches to drop.
+        vc = getattr(self, 'vision_client', None)
+        if vc is not None:
+            vc.reset_state()
+        print_green(f"[export] Cleared {deleted} local file(s) from {EXPORT_DIR}")
+        return {"deleted": deleted, "vision_client_reset": vc is not None}
+
     def _read_json_body(self):
         content_length = int(self.headers.get('Content-Length', 0))
         raw = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
@@ -1350,24 +1385,53 @@ class MapCommandHandler(BaseHTTPRequestHandler):
                     response = {"status": "error", "message": "meta_filename is required"}
                 else:
                     response = vision_client.send_meta_to_autopilot(meta_filename)
-            elif command == 'clear_exports':
+            elif command in ('clear_exports', 'clear_local'):
+                # clear_exports kept as an alias: it is what the older dashboard
+                # and any saved curl commands send.
                 try:
-                    deleted = 0
-                    if EXPORT_DIR.exists():
-                        for f in EXPORT_DIR.iterdir():
-                            if f.is_file():
-                                try:
-                                    f.unlink()
-                                    deleted += 1
-                                except Exception:
-                                    pass
-                    if self.result_store is not None:
-                        self.result_store.clear()
-                    print_green(f"[export] Cleared {deleted} local file(s) from {EXPORT_DIR}")
-                    response = {"status": "success", "message": f"Deleted {deleted} local file(s)"}
+                    r = self._clear_local()
+                    response = {"status": "success",
+                                "message": f"Cleared {r['deleted']} local file(s), mapping session and caches"}
                 except Exception as e:
-                    response = {"status": "error", "message": f"Failed to clear local exports: {e}"}
-                    print_red(f"[api] clear_exports failed: {e}")
+                    response = {"status": "error", "message": f"Failed to clear local state: {e}"}
+                    print_red(f"[api] clear_local failed: {e}")
+
+            elif command == 'clear_all':
+                # Deliberately ordered upstream -> downstream. Each stage caches
+                # the one before it (ground server -> cloud -> local), so
+                # clearing local first just lets the cloud repopulate it on the
+                # next 10s poll. Every stage is attempted even if an earlier one
+                # fails, so one unreachable server cannot leave the rest stale.
+                results, failures = [], []
+                wc = getattr(self.mapper, 'work_client', None)
+                for name, fn in (
+                    ("ground server", lambda: wc.clear_gs()),
+                    ("cloud server", lambda: wc.clear_cloud()),
+                ):
+                    if wc is None:
+                        failures.append(f"{name}: work_client unavailable")
+                        continue
+                    try:
+                        resp = fn()
+                        if 200 <= resp.status_code < 300:
+                            results.append(name)
+                        else:
+                            failures.append(f"{name}: HTTP {resp.status_code}")
+                    except Exception as e:
+                        failures.append(f"{name}: {e}")
+                try:
+                    r = self._clear_local()
+                    results.append(f"local ({r['deleted']} file(s))")
+                except Exception as e:
+                    failures.append(f"local: {e}")
+
+                if failures:
+                    response = {"status": "error",
+                                "message": "Cleared " + (", ".join(results) or "nothing")
+                                           + "; FAILED: " + "; ".join(failures)}
+                    print_red(f"[api] clear_all partial: {failures}")
+                else:
+                    response = {"status": "success", "message": "Cleared " + ", ".join(results)}
             elif command == 'capture_start':
                 try:
                     response = self._capture_command('start', data.get('interval'))

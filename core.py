@@ -233,7 +233,12 @@ def _save_image_for_mapping_local(image: Image.Image, metadata: dict) -> bool:
         alt = 0
     try:
         image_id = metadata["id"]
-        img_filename = f"{image_id}.jpg"
+        # Suffixed with a capture timestamp because gs-backend's clear_mdlc runs
+        # TRUNCATE ... RESTART IDENTITY, so assignment ids restart at 1. With a
+        # bare <id>.jpg a recycled id overwrote the earlier image while its CSV
+        # row was appended, leaving the session claiming two images, holding one,
+        # and able to stitch the new photo at the old photo's coordinates.
+        img_filename = f"{image_id}_{int(time.time() * 1000)}.jpg"
         img_path = MAPPING_SESSION_DIR / "images" / img_filename
         image.save(str(img_path), format="JPEG")
         with open(MAPPING_CSV_PATH, "a", newline="") as f:
@@ -423,6 +428,32 @@ class Mapper:
             else:
                 print_yellow(f"[mapping] Cloud stitch not triggered: {resp.get('detail')}")
         threading.Thread(target=_go, daemon=True, name="cloud-map-trigger").start()
+
+    def reset_state(self):
+        """Drop every trace of the previous flight's mapping state.
+
+        Called by the clear commands. _reset_session() wipes the session folder
+        and its CSV together (the CSV lives inside it), but the result paths and
+        the cloud-mirror dedup set are in memory and used to survive every clear:
+        a stale mapping_result made the dashboard advertise the last flight's
+        map, and a stale _seen_cloud_results meant a fresh cloud map written to a
+        path we had already pulled would never be downloaded again.
+        """
+        _reset_session()
+        try:
+            MAPPING_PREVIEW_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print_yellow(f"[mapping] Could not remove preview: {e}")
+        self.mapping_result = None
+        self.cloud_mapping_result = None
+        self._seen_cloud_results = set()
+        self.cloud_trigger_status = None
+        self.last_image_received_ts = time.time()
+        self.last_auto_trigger_ts = 0.0
+        self.set_progress("idle")
+        print_green("[mapping] Session, preview and cached result paths reset")
 
     def mark_image_received(self):
         """Record timestamp of the latest received image."""
@@ -1119,6 +1150,24 @@ class VisionClient:
         except Exception as e:
             print_red(f"[cloud] Image upload failed: {e}")
     
+    def reset_state(self):
+        """Drop per-flight in-memory caches so a clear really starts over.
+
+        _seen_cloud_signatures is the important one: it keys on
+        (assignment_id, bbox, score) and suppresses repeats. Surviving a clear
+        meant a result the operator had just cleared could never be re-persisted
+        when the cloud served it again - it was silently marked duplicate - and
+        with gs-backend restarting ids at 1, a genuinely new detection on a
+        recycled id could be suppressed too.
+        """
+        self._seen_cloud_signatures = set()
+        self._gd_best_mannequin = None
+        self._gd_best_tent = None
+        self._cycle_count = 0
+        with self._session_start_lock:
+            self._session_start_ts = None
+        print_green("[vision] Per-flight caches reset (dedup, GD bests, session T0)")
+
     def _since_session_start(self, ts: int):
         """Return (session_start_ts, since_session_start_ms) for a classification
         made at time `ts`, or (None, None) if T0 hasn't been established yet

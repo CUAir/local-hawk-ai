@@ -74,6 +74,10 @@
     .btn-danger { color: var(--red); border-color: rgba(248,113,113,.35); }
     .btn-danger:hover { background: rgba(248,113,113,.12); }
 
+    /* The combined clear is the one to reach for: the scoped buttons are
+       order-dependent (ground server -> cloud -> local), so a lone scoped clear
+       is usually repopulated from the stage above it within seconds. */
+    .btn-clear-all { font-weight: 700; box-shadow: 0 0 0 2px var(--red) inset; }
     .action-status { font-size: 12.5px; padding: 0 20px; min-height: 20px; }
     .action-status.success { color: var(--accent); }
     .action-status.error { color: var(--red); }
@@ -340,9 +344,10 @@
       </div>
       <div class="admin-actions">
         <button id="btn-check-cloud" class="btn btn-info">Check Cloud Status</button>
-        <button id="btn-clear-cloud" class="btn btn-danger">Clear Cloud Server</button>
-        <button id="btn-clear-gs" class="btn btn-danger">Clear Ground Server</button>
-        <button id="btn-clear-exports" class="btn btn-danger">Delete Local Saved Images</button>
+        <button id="btn-clear-all" class="btn btn-danger btn-clear-all">Clear Everything</button>
+        <button id="btn-clear-gs" class="btn btn-danger">Clear Ground Server Only</button>
+        <button id="btn-clear-cloud" class="btn btn-danger">Clear Cloud Server Only</button>
+        <button id="btn-clear-exports" class="btn btn-danger">Clear This Laptop Only</button>
       </div>
     </div>
   </div>
@@ -1140,12 +1145,27 @@ async function fetchBest() {
     });
   }
 
+  const btnClearAll = document.getElementById('btn-clear-all');
+  if (btnClearAll) {
+    btnClearAll.addEventListener('click', () => {
+      runAdminCommand(
+        'clear_all',
+        'Clear EVERYTHING, in order: ground server, then cloud server, then this laptop.\n\n'
+        + 'Removes all saved images, detections, telemetry, assignments and the mapping '
+        + 'session.\n\nThis cannot be undone. Continue?',
+        btnClearAll,
+      );
+    });
+  }
+
   const btnClearCloud = document.getElementById('btn-clear-cloud');
   if (btnClearCloud) {
     btnClearCloud.addEventListener('click', () => {
       runAdminCommand(
         'clear_cloud',
-        'Clear the cloud server’s in-memory best images and mapping queue? This cannot be undone.',
+        'Clear the CLOUD SERVER only \u2014 its best images and its mapping queue.\n\n'
+        + 'This does NOT clear this laptop, so the dashboard will keep showing the '
+        + 'images already saved here. Use "Clear Everything" for a full reset.\n\nThis cannot be undone.',
         btnClearCloud,
       );
     });
@@ -1156,7 +1176,10 @@ async function fetchBest() {
     btnClearGs.addEventListener('click', () => {
       runAdminCommand(
         'clear_gs',
-        'Clear the ground server’s database (images, targets, telemetry, assignments) and image directory? This cannot be undone.',
+        'Clear the GROUND SERVER only \u2014 its database (images, targets, telemetry, '
+        + 'assignments) and image directory.\n\nThis does NOT clear this laptop or the cloud, '
+        + 'and it restarts image IDs at 1. Use "Clear Everything" for a full reset.'
+        + '\n\nThis cannot be undone.',
         btnClearGs,
       );
     });
@@ -1167,7 +1190,10 @@ async function fetchBest() {
     btnClearExports.addEventListener('click', () => {
       runAdminCommand(
         'clear_exports',
-        'Delete all locally saved images and metadata in ./exports? This cannot be undone.',
+        'Clear THIS LAPTOP only \u2014 saved images in ./exports, the mapping session '
+        + 'and its CSV, and cached detection state.\n\nThis does NOT clear the cloud or the '
+        + 'ground server, so new results may arrive from them. Use "Clear Everything" for a '
+        + 'full reset.\n\nThis cannot be undone.',
         btnClearExports,
       );
     });
