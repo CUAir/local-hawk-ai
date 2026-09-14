@@ -1,7 +1,14 @@
 # Core runtime
 requests
 pillow
-opencv-python
+# Pinned below 5: opencv-python 5.x removed cv2.AKAZE_create from the base
+# wheel (AKAZE moved to cv2.xfeatures2d, which ships only in
+# opencv-contrib-python). mapping/stitcher.py uses AKAZE as its fallback
+# detector, and on real flight frames it finds ~40k keypoints per image at
+# the configured threshold, so losing it measurably degrades stitch quality.
+# The stitcher degrades to SIFT-only rather than crashing if this pin is
+# ever bypassed, but 4.x is the supported configuration.
+opencv-python<5
 colorama
 numpy
 scipy
