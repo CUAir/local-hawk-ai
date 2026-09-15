@@ -338,10 +338,16 @@ class WorkClient(object):
         return response
 
     def clear_gs(self) -> requests.Response:
-        """POST /util/clear_mdlc on the ground server — truncates the image/target/
-        telemetry/assignment tables and wipes its images/ directory on disk. Unlike
-        clear_cloud(), gs-backend's endpoint has no auth header requirement."""
-        url = self.gs_url + "util/clear_mdlc"
+        """POST /api/v1/util/clear_mdlc on the ground server — truncates the image/
+        target/telemetry/assignment tables and wipes its images/ directory on disk.
+        Unlike clear_cloud(), gs-backend's endpoint has no auth header requirement.
+
+        The api/v1 prefix is gs-backend's server.servlet.context-path, so every one
+        of its routes sits under it. This was the one ground-server endpoint here
+        missing it, and the resulting 404 read as "cleared everything except the
+        ground server" - the clear reported failure but the other two stages had
+        already run."""
+        url = self.gs_url + "api/v1/util/clear_mdlc"
         logger.info("Clearing ground server state — url=%s", url)
         try:
             response = self._do_request_with_retries(
